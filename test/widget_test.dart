@@ -8,12 +8,13 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 
+import 'package:silent_domain/core/database/message_store.dart';
 import 'package:silent_domain/models/message.dart';
 import 'package:silent_domain/main.dart';
 
 void main() {
   testWidgets('启动页可以进入静域首页', (WidgetTester tester) async {
-    await tester.pumpWidget(const SilentDomainApp());
+    await tester.pumpWidget(SilentDomainApp());
     expect(find.text('静域'), findsOneWidget);
 
     await tester.pump(const Duration(milliseconds: 1600));
@@ -23,7 +24,7 @@ void main() {
   });
 
   testWidgets('失败消息可以点击重试', (WidgetTester tester) async {
-    await tester.pumpWidget(const SilentDomainApp());
+    await tester.pumpWidget(SilentDomainApp());
     await tester.pump(const Duration(milliseconds: 1600));
     await tester.pumpAndSettle();
     await tester.tap(find.text('聊天'));
@@ -50,5 +51,21 @@ void main() {
     expect(completed.id, 'message-1');
     expect(completed.content, '测试');
     expect(completed.status, MessageStatus.success);
+  });
+
+  test('MessageStore 可以保存并读取消息', () async {
+    final store = MemoryMessageStore();
+    final message = Message(
+      id: 'persisted-message',
+      sender: 'self',
+      content: '本地保存测试',
+      timestamp: DateTime(2026, 1, 1),
+    );
+
+    await store.saveMessage(message);
+    final messages = await store.loadMessages();
+
+    expect(messages, hasLength(1));
+    expect(messages.single.content, '本地保存测试');
   });
 }

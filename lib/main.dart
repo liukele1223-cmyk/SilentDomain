@@ -2,12 +2,20 @@ import 'dart:async';
 
 import 'package:flutter/material.dart';
 
+import 'core/database/message_store.dart';
 import 'models/message.dart';
 
-void main() => runApp(const SilentDomainApp());
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  final messageStore = await HiveMessageStore.create();
+  runApp(SilentDomainApp(messageStore: messageStore));
+}
 
 class SilentDomainApp extends StatelessWidget {
-  const SilentDomainApp({super.key});
+  SilentDomainApp({super.key, MessageStore? messageStore})
+    : messageStore = messageStore ?? MemoryMessageStore();
+
+  final MessageStore messageStore;
 
   @override
   Widget build(BuildContext context) {
@@ -31,13 +39,15 @@ class SilentDomainApp extends StatelessWidget {
           ),
         ),
       ),
-      home: const SplashPage(),
+      home: SplashPage(messageStore: messageStore),
     );
   }
 }
 
 class SplashPage extends StatefulWidget {
-  const SplashPage({super.key});
+  const SplashPage({required this.messageStore, super.key});
+
+  final MessageStore messageStore;
 
   @override
   State<SplashPage> createState() => _SplashPageState();
@@ -59,7 +69,9 @@ class _SplashPageState extends State<SplashPage>
     Timer(const Duration(milliseconds: 1500), () {
       if (mounted) {
         Navigator.of(context).pushReplacement(
-          MaterialPageRoute<void>(builder: (_) => const AppShell()),
+          MaterialPageRoute<void>(
+            builder: (_) => AppShell(messageStore: widget.messageStore),
+          ),
         );
       }
     });
@@ -106,7 +118,9 @@ class _SplashPageState extends State<SplashPage>
 }
 
 class AppShell extends StatefulWidget {
-  const AppShell({super.key});
+  const AppShell({required this.messageStore, super.key});
+
+  final MessageStore messageStore;
 
   @override
   State<AppShell> createState() => _AppShellState();
@@ -114,12 +128,16 @@ class AppShell extends StatefulWidget {
 
 class _AppShellState extends State<AppShell> {
   int _index = 0;
-  final _pages = const [HomePage(), ChatPage(), SettingsPage()];
 
   @override
   Widget build(BuildContext context) {
+    final pages = [
+      const HomePage(),
+      ChatPage(messageStore: widget.messageStore),
+      const SettingsPage(),
+    ];
     return Scaffold(
-      body: IndexedStack(index: _index, children: _pages),
+      body: IndexedStack(index: _index, children: pages),
       bottomNavigationBar: NavigationBar(
         selectedIndex: _index,
         onDestinationSelected: (index) => setState(() => _index = index),
@@ -238,7 +256,9 @@ class HomePage extends StatelessWidget {
 }
 
 class ChatPage extends StatefulWidget {
-  const ChatPage({super.key});
+  const ChatPage({required this.messageStore, super.key});
+
+  final MessageStore messageStore;
 
   @override
   State<ChatPage> createState() => _ChatPageState();
@@ -246,27 +266,51 @@ class ChatPage extends StatefulWidget {
 
 class _ChatPageState extends State<ChatPage> {
   final _controller = TextEditingController();
-  final _messages = <Message>[
-    Message(
-      id: 'welcome',
-      sender: 'nearby-device',
-      content: '欢迎来到静域。',
-      timestamp: DateTime(2026, 1, 1, 9, 41),
-    ),
-    Message(
-      id: 'offline',
-      sender: 'self',
-      content: '这里不需要互联网。',
-      timestamp: DateTime(2026, 1, 1, 9, 42),
-    ),
-    Message(
-      id: 'failed-demo',
-      sender: 'self',
-      content: '这是一条发送失败的消息',
-      timestamp: DateTime(2026, 1, 1, 9, 43),
-      status: MessageStatus.failed,
-    ),
-  ];
+  final _messages = <Message>[];
+  bool _isLoading = true;
+
+  @override
+  void initState() {
+    super.initState();
+    _loadMessages();
+  }
+
+  Future<void> _loadMessages() async {
+    final messages = await widget.messageStore.loadMessages();
+    if (messages.isEmpty) {
+      messages.addAll([
+        Message(
+          id: 'welcome',
+          sender: 'nearby-device',
+          content: '欢迎来到静域。',
+          timestamp: DateTime(2026, 1, 1, 9, 41),
+        ),
+        Message(
+          id: 'offline',
+          sender: 'self',
+          content: '这里不需要互联网。',
+          timestamp: DateTime(2026, 1, 1, 9, 42),
+        ),
+        Message(
+          id: 'failed-demo',
+          sender: 'self',
+          content: '这是一条发送失败的消息',
+          timestamp: DateTime(2026, 1, 1, 9, 43),
+          status: MessageStatus.failed,
+        ),
+      ]);
+      for (final message in messages) {
+        await widget.messageStore.saveMessage(message);
+      }
+    }
+    if (!mounted) return;
+    setState(() {
+      _messages
+        ..clear()
+        ..addAll(messages);
+      _isLoading = false;
+    });
+  }
 
   @override
   void dispose() {
@@ -319,14 +363,16 @@ class _ChatPageState extends State<ChatPage> {
           ),
           const Divider(height: 1),
           Expanded(
-            child: ListView.builder(
-              padding: const EdgeInsets.fromLTRB(18, 22, 18, 18),
-              itemCount: _messages.length,
-              itemBuilder: (_, index) => _MessageBubble(
-                message: _messages[index],
-                onRetry: () => _retryMessage(_messages[index]),
-              ),
-            ),
+            child: _isLoading
+                ? const Center(child: CircularProgressIndicator())
+                : ListView.builder(
+                    padding: const EdgeInsets.fromLTRB(18, 22, 18, 18),
+                    itemCount: _messages.length,
+                    itemBuilder: (_, index) => _MessageBubble(
+                      message: _messages[index],
+                      onRetry: () => _retryMessage(_messages[index]),
+                    ),
+                  ),
           ),
           _Composer(controller: _controller, onSend: _sendMessage),
         ],
@@ -348,6 +394,7 @@ class _ChatPageState extends State<ChatPage> {
       _messages.add(message);
       _controller.clear();
     });
+    unawaited(widget.messageStore.saveMessage(message));
 
     Timer(const Duration(milliseconds: 450), () {
       if (!mounted) return;
@@ -360,6 +407,7 @@ class _ChatPageState extends State<ChatPage> {
               : MessageStatus.success,
         );
       });
+      unawaited(widget.messageStore.saveMessage(_messages[index]));
     });
   }
 
@@ -369,6 +417,7 @@ class _ChatPageState extends State<ChatPage> {
     setState(() {
       _messages[index] = message.copyWith(status: MessageStatus.sending);
     });
+    unawaited(widget.messageStore.saveMessage(_messages[index]));
     Timer(const Duration(milliseconds: 450), () {
       if (!mounted) return;
       final currentIndex = _messages.indexWhere(
@@ -380,6 +429,7 @@ class _ChatPageState extends State<ChatPage> {
           status: MessageStatus.success,
         );
       });
+      unawaited(widget.messageStore.saveMessage(_messages[currentIndex]));
     });
   }
 }
