@@ -1,17 +1,98 @@
-# silent_domain
+# 静域 · Silent Domain
 
-A new Flutter project.
+静域是一个面向无网络场景的 Android 离线私密聊天应用。它不需要服务器、账号、手机号或互联网：两台附近的手机通过蓝牙低功耗（BLE）发现并建立加密通信通道，即可直接收发文字消息。
 
-## Getting Started
+> 当前版本为开发测试版，已在两台 Android 真机完成附近设备发现、验证码确认和 200～400 字文字消息收发验证。
 
-This project is a starting point for a Flutter application.
+## 1. 项目解决什么问题
 
-A few resources to get you started if this is your first Flutter project:
+在火车、飞机、地铁、户外旅行或网络不可用的区域，常见聊天软件无法建立通信。静域提供不依赖运营商网络或云端服务器的近距离文字沟通方式。
 
-- [Learn Flutter](https://docs.flutter.dev/get-started/learn-flutter)
-- [Write your first Flutter app](https://docs.flutter.dev/get-started/codelab)
-- [Flutter learning resources](https://docs.flutter.dev/reference/learning-resources)
+项目遵循以下边界：
 
-For help getting started with Flutter development, view the
-[online documentation](https://docs.flutter.dev/), which offers tutorials,
-samples, guidance on mobile development, and a full API reference.
+- 不需要注册账号或手机号。
+- 不上传聊天内容，也不依赖后端服务。
+- 聊天记录仅保存在本机，并使用加密数据库保存。
+- 蓝牙连接前需要人工核对验证码，避免误连附近设备。
+
+## 2. 主要功能
+
+### 已实现
+
+- BLE 附近静域设备发现与广播，过滤手环、耳机等非静域设备。
+- 双方验证码确认、连接状态展示、手动断开连接。
+- 单对单离线文字聊天；消息支持发送中、送达和失败重试状态。
+- 长文本传输：优先协商更大的 BLE MTU，协商失败时自动回退为可靠的默认分帧传输。
+- 会话安全：设备长期 Ed25519 身份、每次连接临时 X25519 ECDH 密钥协商、AES-256-GCM 消息与回执加密。
+- 本地数据保护：Hive AES 加密数据库；数据库密钥由 Android Keystore / iOS Keychain 支持的系统安全存储保护。
+- Material 3 界面：首页、设备发现、连接确认、聊天和设置页。
+
+### 计划中
+
+- 自定义表情包导入、移除 EXIF、压缩与加密保存。
+- 主题系统。
+- 图片传输。
+- 多人 Mesh 离线通信。
+
+## 3. 安装方法
+
+### 运行开发环境
+
+前置条件：Flutter SDK、Android SDK、已开启 USB 调试或无线调试的 Android 手机。
+
+```powershell
+flutter pub get
+flutter run
+```
+
+首次运行时，请在两台手机上允许“附近的设备”蓝牙权限。
+
+### 构建并安装调试 APK
+
+```powershell
+flutter build apk --debug --target-platform android-arm64
+adb install -r build\app\outputs\flutter-apk\app-debug.apk
+```
+
+调试 APK 仅用于开发和测试；正式发布前仍需配置独立签名与发布流程。
+
+## 4. 使用方法
+
+1. 两台手机都安装相同版本的静域，并打开蓝牙。
+2. 在手机 A 首页点击“开始广播”。
+3. 在手机 B 点击“发现设备”→“开始搜索”，选择显示的静域设备。
+4. 两台设备核对相同验证码；广播端点击“确认连接”。
+5. 连接端显示“开始聊天”后进入聊天页，双方即可收发文字。
+6. 需要结束会话时，在聊天页右上角 `…` 中选择“断开连接”。
+
+每次应用重启或重新安装后，需要重新建立蓝牙会话。
+
+## 5. 输入输出示例
+
+| 场景 | 输入 / 操作 | 预期输出 |
+| --- | --- | --- |
+| 建立连接 | 手机 A 广播；手机 B 搜索并选择设备；双方确认验证码 | 聊天页显示“已连接 · 蓝牙离线通道” |
+| 普通消息 | 输入 `你好，离线聊天测试。` 后发送 | 对方显示同一条消息；发送方状态变为送达 |
+| 长消息 | 输入约 200～400 字文本后发送 | 对方收到完整文本；发送方显示送达 |
+| 断开后发送 | 在菜单中断开连接，再发送 `测试` | 消息显示红色感叹号；点击可在重新连接后重试 |
+
+## 开发与验证
+
+```powershell
+flutter analyze
+flutter test
+```
+
+当前自动测试覆盖启动页、设备发现流程、消息状态、本地存储、BLE 帧重组、UUID 协议以及 ECDH/AES-GCM 加密与篡改拒绝行为。
+
+## 技术栈
+
+- Flutter / Dart / Material 3
+- `universal_ble`：BLE 发现、GATT 通信与外围端广播
+- `cryptography`：Ed25519、X25519、AES-256-GCM
+- Hive：加密本地消息数据库
+- `flutter_secure_storage`：系统安全密钥存储
+
+## 隐私说明
+
+静域不要求用户提供姓名、手机号、账号或云端身份。应用不会主动上传聊天内容；消息与本地记录均按当前实现保留在用户设备和附近蓝牙通信范围内。
