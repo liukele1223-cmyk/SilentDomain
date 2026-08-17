@@ -29,6 +29,7 @@ class UniversalBlePeripheralChat {
 
   Future<void> initialize({String localName = 'Silent Domain'}) async {
     _ensureOpen();
+    await _ensurePermissions();
     final capabilities = await UniversalBlePeripheral.getCapabilities();
     if (!capabilities.supportsPeripheralMode) {
       throw UnsupportedError('当前设备不支持 BLE 外围端模式');
@@ -66,6 +67,16 @@ class UniversalBlePeripheralChat {
       localName: localName,
     );
     _initialized = true;
+  }
+
+  Future<void> _ensurePermissions() async {
+    if (await UniversalBle.hasPermissions(withAndroidFineLocation: true)) {
+      return;
+    }
+    await UniversalBle.requestPermissions(withAndroidFineLocation: true);
+    if (!await UniversalBle.hasPermissions(withAndroidFineLocation: true)) {
+      throw StateError('蓝牙权限未授予');
+    }
   }
 
   Future<void> send(String deviceId, BlePacket packet) async {

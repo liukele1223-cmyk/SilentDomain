@@ -45,6 +45,7 @@ class BleDiscoveryService implements DiscoveryService {
 
   @override
   Future<void> startScan() async {
+    await _ensurePermissions();
     final state = await UniversalBle.getBluetoothAvailabilityState();
     if (state != AvailabilityState.poweredOn) {
       throw StateError('请先打开蓝牙');
@@ -58,8 +59,19 @@ class BleDiscoveryService implements DiscoveryService {
 
   @override
   Future<void> connect(NearbyDevice device) async {
+    await _ensurePermissions();
     await UniversalBle.connect(device.id, timeout: const Duration(seconds: 15));
     _connectedDeviceId = device.id;
+  }
+
+  Future<void> _ensurePermissions() async {
+    if (await UniversalBle.hasPermissions(withAndroidFineLocation: true)) {
+      return;
+    }
+    await UniversalBle.requestPermissions(withAndroidFineLocation: true);
+    if (!await UniversalBle.hasPermissions(withAndroidFineLocation: true)) {
+      throw StateError('蓝牙权限未授予');
+    }
   }
 
   @override
