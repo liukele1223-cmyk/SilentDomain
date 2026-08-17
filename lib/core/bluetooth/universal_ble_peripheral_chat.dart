@@ -16,12 +16,20 @@ class PeripheralBlePacket {
 ///
 /// 一个外围端可同时接受多个中心端连接；每个中心端独立维护分帧状态。
 class UniversalBlePeripheralChat {
-  UniversalBlePeripheralChat();
+  UniversalBlePeripheralChat() {
+    _subscriptionListener = UniversalBlePeripheral
+        .characteristicSubscriptionStream
+        .listen(_flushPendingNotifications);
+  }
 
   final StreamController<PeripheralBlePacket> _incomingController =
       StreamController<PeripheralBlePacket>.broadcast();
   final Map<String, _PeripheralFrameBuffer> _buffers =
       <String, _PeripheralFrameBuffer>{};
+  final Map<String, List<BlePacket>> _pendingNotifications =
+      <String, List<BlePacket>>{};
+  StreamSubscription<BlePeripheralCharacteristicSubscriptionChanged>?
+  _subscriptionListener;
   bool _initialized = false;
   bool _closed = false;
 
@@ -62,10 +70,26 @@ class UniversalBlePeripheralChat {
       );
     }
 
+    // Android 的主广播包与扫描响应包各最多容纳约 31 字节。把 128 位服务
+    // UUID 放在扫描响应包，避免与设备名共存时因超长而异步广播失败。
+    final advertisingState = UniversalBlePeripheral.advertisingStateStream
+        .firstWhere(
+          (event) =>
+              event.state == PeripheralAdvertisingState.advertising ||
+              event.state == PeripheralAdvertisingState.error,
+        )
+        .timeout(const Duration(seconds: 5));
     await UniversalBlePeripheral.startAdvertising(
       services: [SilentDomainBleUuid.service],
       localName: localName,
+      platformConfig: PeripheralPlatformConfig(
+        android: PeripheralAndroidOptions(addServicesInScanResponse: true),
+      ),
     );
+    final event = await advertisingState;
+    if (event.state == PeripheralAdvertisingState.error) {
+      throw StateError(event.error ?? '蓝牙广播启动失败');
+    }
     _initialized = true;
   }
 
@@ -81,12 +105,42 @@ class UniversalBlePeripheralChat {
 
   Future<void> send(String deviceId, BlePacket packet) async {
     _ensureReady();
+    final subscribedClients = await UniversalBlePeripheral.getSubscribedClients(
+      SilentDomainBleUuid.notifyCharacteristic,
+    );
+    if (!subscribedClients.contains(deviceId)) {
+      _pendingNotifications
+          .putIfAbsent(deviceId, () => <BlePacket>[])
+          .add(packet);
+      return;
+    }
+    await _sendNow(deviceId, packet);
+  }
+
+  Future<void> _sendNow(String deviceId, BlePacket packet) async {
     for (final frame in BleFrameCodec.split(packet.encode())) {
       await UniversalBlePeripheral.updateCharacteristicValue(
         characteristicId: SilentDomainBleUuid.notifyCharacteristic,
         deviceId: deviceId,
         value: frame,
       );
+    }
+  }
+
+  void _flushPendingNotifications(
+    BlePeripheralCharacteristicSubscriptionChanged event,
+  ) {
+    if (!event.isSubscribed ||
+        !BleUuidParser.compareStrings(
+          event.characteristicId,
+          SilentDomainBleUuid.notifyCharacteristic,
+        )) {
+      return;
+    }
+    final packets = _pendingNotifications.remove(event.deviceId);
+    if (packets == null) return;
+    for (final packet in packets) {
+      unawaited(_sendNow(event.deviceId, packet));
     }
   }
 
@@ -125,6 +179,7 @@ class UniversalBlePeripheralChat {
   Future<void> stop() async {
     if (!_initialized) return;
     await UniversalBlePeripheral.stopAdvertising();
+    _pendingNotifications.clear();
     _initialized = false;
   }
 
@@ -132,6 +187,7 @@ class UniversalBlePeripheralChat {
     if (_closed) return;
     await stop();
     UniversalBlePeripheral.setWriteRequestHandlers(null);
+    await _subscriptionListener?.cancel();
     _buffers.clear();
     _closed = true;
     await _incomingController.close();

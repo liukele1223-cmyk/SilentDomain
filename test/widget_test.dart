@@ -26,7 +26,7 @@ void main() {
     expect(find.text('最近聊天'), findsOneWidget);
   });
 
-  testWidgets('失败消息可以点击重试', (WidgetTester tester) async {
+  testWidgets('未连接时失败消息重试后仍显示失败', (WidgetTester tester) async {
     await tester.pumpWidget(SilentDomainApp());
     await tester.pump(const Duration(milliseconds: 1600));
     await tester.pumpAndSettle();
@@ -36,9 +36,7 @@ void main() {
     expect(find.byIcon(Icons.error_outline_rounded), findsOneWidget);
     await tester.tap(find.byIcon(Icons.error_outline_rounded));
     await tester.pump();
-    expect(find.byType(CircularProgressIndicator), findsOneWidget);
-    await tester.pump(const Duration(milliseconds: 500));
-    expect(find.byIcon(Icons.error_outline_rounded), findsNothing);
+    expect(find.byIcon(Icons.error_outline_rounded), findsOneWidget);
   });
 
   testWidgets('首页可以打开 BLE 设备发现面板', (WidgetTester tester) async {
@@ -66,7 +64,18 @@ void main() {
     expect(find.text('确认并连接'), findsOneWidget);
     await tester.tap(find.text('确认并连接'));
     await tester.pumpAndSettle();
-    expect(find.text('已连接'), findsOneWidget);
+    expect(find.text('开始聊天'), findsOneWidget);
+    await tester.tap(find.text('开始聊天'));
+    await tester.pumpAndSettle();
+    expect(find.text('附近设备'), findsOneWidget);
+    expect(find.text('已连接 · 蓝牙离线通道'), findsOneWidget);
+
+    await tester.tap(find.byIcon(Icons.more_horiz_rounded));
+    await tester.pumpAndSettle();
+    expect(find.text('断开连接'), findsOneWidget);
+    await tester.tap(find.text('断开连接'));
+    await tester.pumpAndSettle();
+    expect(find.text('等待连接 · 离线'), findsOneWidget);
   });
 
   test('Message copyWith 保留未修改字段', () {

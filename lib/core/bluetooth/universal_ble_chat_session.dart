@@ -14,13 +14,15 @@ class UniversalBleChatSession implements BleChatSession {
   final StreamController<List<int>> _incomingController =
       StreamController<List<int>>.broadcast();
   StreamSubscription<dynamic>? _notificationListener;
+  CharacteristicSubscription? _subscription;
 
   int? _frameTotal;
   final Map<int, List<int>> _frames = <int, List<int>>{};
   bool _closed = false;
 
-  /// 发现服务、校验特征并订阅通知，返回可用于聊天的会话。
-  static Future<UniversalBleChatSession> connect(String deviceId) async {
+  /// 发现服务并打开会话。通知订阅由 [subscribeNotifications] 单独启动，
+  /// 以便连接请求先通过写入特征抵达外围端。
+  static Future<UniversalBleChatSession> open(String deviceId) async {
     final services = await UniversalBle.discoverServices(deviceId);
     BleCharacteristic? notifyCharacteristic;
 
@@ -55,8 +57,42 @@ class UniversalBleChatSession implements BleChatSession {
     session._notificationListener = subscription.listen(
       (value) => session._handleFrame(value),
     );
-    await subscription.subscribe();
+    session._subscription = subscription;
     return session;
+  }
+
+  /// 建立通知订阅以接收外围端回包。
+  Future<void> subscribeNotifications() async {
+    _ensureOpen();
+    final subscription = _subscription;
+    if (subscription == null) {
+      throw StateError('静域 BLE 通知订阅尚未准备好');
+    }
+    // 部分 Android 设备会在 discoverServices 后立即进行连接参数协商。
+    // 此时写 CCCD 描述符会返回 WRITE_REQUEST_BUSY，先等待链路稳定。
+    await Future<void>.delayed(const Duration(milliseconds: 1200));
+    await _subscribeWithRetry(subscription);
+  }
+
+  Future<void> _subscribeWithRetry(
+    CharacteristicSubscription subscription,
+  ) async {
+    Object? lastError;
+    for (var attempt = 0; attempt < 6; attempt++) {
+      try {
+        await subscription.subscribe();
+        return;
+      } on Object catch (error) {
+        lastError = error;
+        final message = error.toString();
+        final isTemporarilyBusy =
+            message.contains('writeRequestBusy') ||
+            message.contains('WRITE_REQUEST_BUSY');
+        if (!isTemporarilyBusy || attempt == 5) rethrow;
+        await Future<void>.delayed(Duration(milliseconds: 500 + 250 * attempt));
+      }
+    }
+    throw StateError('通知订阅失败：$lastError');
   }
 
   @override

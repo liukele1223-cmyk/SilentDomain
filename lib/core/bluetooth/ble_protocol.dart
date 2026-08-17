@@ -64,7 +64,9 @@ class BlePacket {
 
 /// 将一个 BLE 数据包切成不超过 MTU 友好长度的帧。
 abstract final class BleFrameCodec {
-  static const payloadSize = 180;
+  // 在未协商 MTU 的 Android BLE 连接中，默认 ATT MTU 常为 23 字节。
+  // 保留 4 字节帧头后，单帧最多 20 字节，确保小米与荣耀等设备都能写入。
+  static const payloadSize = 20;
   static const _headerSize = 4;
 
   static List<Uint8List> split(Uint8List bytes) {

@@ -1,8 +1,11 @@
 import 'dart:async';
+import 'dart:convert';
+import 'dart:math';
 
 import 'package:flutter/material.dart';
 
 import 'core/bluetooth/discovery_service.dart';
+import 'core/bluetooth/ble_protocol.dart';
 import 'core/bluetooth/universal_ble_peripheral_chat.dart';
 import 'core/database/message_store.dart';
 import 'models/message.dart';
@@ -173,8 +176,13 @@ class _AppShellState extends State<AppShell> {
       HomePage(
         discoveryService: widget.discoveryService,
         peripheralService: widget.peripheralService,
+        onOpenChat: _openChat,
       ),
-      ChatPage(messageStore: widget.messageStore),
+      ChatPage(
+        messageStore: widget.messageStore,
+        discoveryService: widget.discoveryService,
+        peripheralService: widget.peripheralService,
+      ),
       const SettingsPage(),
     ];
     return Scaffold(
@@ -203,6 +211,10 @@ class _AppShellState extends State<AppShell> {
     );
   }
 
+  void _openChat() {
+    setState(() => _index = 1);
+  }
+
   @override
   void dispose() {
     widget.peripheralService.dispose();
@@ -214,11 +226,13 @@ class HomePage extends StatefulWidget {
   const HomePage({
     required this.discoveryService,
     required this.peripheralService,
+    required this.onOpenChat,
     super.key,
   });
 
   final DiscoveryService discoveryService;
   final UniversalBlePeripheralChat peripheralService;
+  final VoidCallback onOpenChat;
 
   @override
   State<HomePage> createState() => _HomePageState();
@@ -227,6 +241,21 @@ class HomePage extends StatefulWidget {
 class _HomePageState extends State<HomePage> {
   bool _broadcasting = false;
   String? _broadcastError;
+  StreamSubscription<PeripheralBlePacket>? _incomingPacketSubscription;
+  bool _pairingDialogVisible = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _incomingPacketSubscription = widget.peripheralService.incomingPackets
+        .listen((incoming) => unawaited(_handlePairingPacket(incoming)));
+  }
+
+  @override
+  void dispose() {
+    _incomingPacketSubscription?.cancel();
+    super.dispose();
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -303,7 +332,13 @@ class _HomePageState extends State<HomePage> {
     showModalBottomSheet<void>(
       context: context,
       showDragHandle: true,
-      builder: (_) => DeviceDiscoverySheet(service: widget.discoveryService),
+      builder: (sheetContext) => DeviceDiscoverySheet(
+        service: widget.discoveryService,
+        onOpenChat: () {
+          Navigator.of(sheetContext).pop();
+          widget.onOpenChat();
+        },
+      ),
     );
   }
 
@@ -320,6 +355,68 @@ class _HomePageState extends State<HomePage> {
       if (mounted) {
         setState(() => _broadcastError = _friendlyBleError(error));
       }
+    }
+  }
+
+  Future<void> _handlePairingPacket(PeripheralBlePacket incoming) async {
+    if (!mounted || _pairingDialogVisible) return;
+    BlePacket packet;
+    try {
+      packet = BlePacket.decode(incoming.bytes);
+    } on FormatException {
+      return;
+    }
+    if (packet.type != BlePacketType.hello || packet.id != 'pairing-request') {
+      return;
+    }
+
+    _pairingDialogVisible = true;
+    try {
+      final accepted = await showDialog<bool>(
+        context: context,
+        barrierDismissible: false,
+        builder: (context) => AlertDialog(
+          icon: const Icon(Icons.verified_user_outlined),
+          title: const Text('收到连接请求'),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Text('请与另一台手机核对验证码'),
+              const SizedBox(height: 18),
+              Text(
+                packet.payload,
+                style: const TextStyle(
+                  fontSize: 30,
+                  fontWeight: FontWeight.w700,
+                  letterSpacing: 6,
+                ),
+              ),
+            ],
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(context).pop(false),
+              child: const Text('拒绝'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.of(context).pop(true),
+              child: const Text('确认连接'),
+            ),
+          ],
+        ),
+      );
+      if (accepted == true) {
+        await widget.peripheralService.send(
+          incoming.deviceId,
+          BlePacket(
+            type: BlePacketType.acknowledgement,
+            id: packet.id,
+            payload: packet.payload,
+          ),
+        );
+      }
+    } finally {
+      _pairingDialogVisible = false;
     }
   }
 
@@ -397,9 +494,14 @@ class _BroadcastCard extends StatelessWidget {
 }
 
 class DeviceDiscoverySheet extends StatefulWidget {
-  const DeviceDiscoverySheet({required this.service, super.key});
+  const DeviceDiscoverySheet({
+    required this.service,
+    required this.onOpenChat,
+    super.key,
+  });
 
   final DiscoveryService service;
+  final VoidCallback onOpenChat;
 
   @override
   State<DeviceDiscoverySheet> createState() => _DeviceDiscoverySheetState();
@@ -434,6 +536,11 @@ class _DeviceDiscoverySheetState extends State<DeviceDiscoverySheet> {
                   ),
                 ],
                 const SizedBox(height: 18),
+                if (_isScanning)
+                  const Padding(
+                    padding: EdgeInsets.only(bottom: 12),
+                    child: Text('正在搜索附近的静域设备…'),
+                  ),
                 if (devices.isEmpty && !_isScanning)
                   const Padding(
                     padding: EdgeInsets.symmetric(vertical: 18),
@@ -452,15 +559,19 @@ class _DeviceDiscoverySheetState extends State<DeviceDiscoverySheet> {
                     title: Text(device.name),
                     subtitle: Text('信号强度 ${device.rssi ?? '--'} dBm'),
                     trailing: const Icon(Icons.chevron_right_rounded),
-                    onTap: () {
-                      Navigator.of(context).push(
-                        MaterialPageRoute<void>(
-                          builder: (_) => ConnectionRequestPage(
-                            device: device,
-                            service: widget.service,
-                          ),
-                        ),
-                      );
+                    onTap: () async {
+                      final shouldOpenChat = await Navigator.of(context)
+                          .push<bool>(
+                            MaterialPageRoute<bool>(
+                              builder: (_) => ConnectionRequestPage(
+                                device: device,
+                                service: widget.service,
+                              ),
+                            ),
+                          );
+                      if (shouldOpenChat == true && mounted) {
+                        widget.onOpenChat();
+                      }
                     },
                   ),
                 FilledButton.icon(
@@ -489,6 +600,8 @@ class _DeviceDiscoverySheetState extends State<DeviceDiscoverySheet> {
     });
     try {
       await widget.service.startScan();
+      // 扫描服务会在 12 秒后停止。保持界面中的搜索状态，避免按钮闪回。
+      await Future<void>.delayed(const Duration(seconds: 12));
     } on Object catch (error) {
       if (mounted) {
         setState(
@@ -520,10 +633,8 @@ class _ConnectionRequestPageState extends State<ConnectionRequestPage> {
   bool _connected = false;
   String? _error;
 
-  String get _verificationCode {
-    final value = widget.device.id.hashCode.abs() % 900000;
-    return (value + 100000).toString();
-  }
+  late final String _verificationCode =
+      (Random.secure().nextInt(900000) + 100000).toString();
 
   @override
   Widget build(BuildContext context) {
@@ -580,14 +691,16 @@ class _ConnectionRequestPageState extends State<ConnectionRequestPage> {
                 const Padding(
                   padding: EdgeInsets.only(bottom: 14),
                   child: Text(
-                    '连接请求已确认，等待通信通道建立。',
+                    '两台设备已确认，静域通信通道已建立。',
                     textAlign: TextAlign.center,
                     style: TextStyle(color: Color(0xFF2E7D5B)),
                   ),
                 ),
               FilledButton.icon(
-                onPressed: _isConnecting || _connected
+                onPressed: _isConnecting
                     ? null
+                    : _connected
+                    ? _openChat
                     : _confirmConnection,
                 icon: _isConnecting
                     ? const SizedBox(
@@ -595,10 +708,14 @@ class _ConnectionRequestPageState extends State<ConnectionRequestPage> {
                         height: 18,
                         child: CircularProgressIndicator(strokeWidth: 2),
                       )
-                    : const Icon(Icons.link_rounded),
+                    : Icon(
+                        _connected
+                            ? Icons.chat_bubble_rounded
+                            : Icons.link_rounded,
+                      ),
                 label: Text(
                   _connected
-                      ? '已连接'
+                      ? '开始聊天'
                       : _isConnecting
                       ? '正在连接…'
                       : '确认并连接',
@@ -617,24 +734,48 @@ class _ConnectionRequestPageState extends State<ConnectionRequestPage> {
       _error = null;
     });
     try {
-      await widget.service.connect(widget.device);
+      await widget.service.connect(
+        widget.device,
+        verificationCode: _verificationCode,
+      );
       if (mounted) setState(() => _connected = true);
     } on Object catch (error) {
       if (mounted) {
-        setState(
-          () => _error = error.toString().replaceFirst('Bad state: ', ''),
-        );
+        setState(() => _error = _friendlyConnectionError(error));
       }
     } finally {
       if (mounted) setState(() => _isConnecting = false);
     }
   }
+
+  void _openChat() {
+    Navigator.of(context).pop(true);
+  }
+
+  String _friendlyConnectionError(Object error) {
+    final message = error.toString();
+    if (message.contains('writeRequestBusy') ||
+        message.contains('WRITE_REQUEST_BUSY')) {
+      return '另一台设备正在准备通信通道，请稍后重试。';
+    }
+    if (message.contains('TimeoutException')) {
+      return '等待另一台设备确认超时，请重新发起连接。';
+    }
+    return message.replaceFirst('Bad state: ', '');
+  }
 }
 
 class ChatPage extends StatefulWidget {
-  const ChatPage({required this.messageStore, super.key});
+  const ChatPage({
+    required this.messageStore,
+    required this.discoveryService,
+    required this.peripheralService,
+    super.key,
+  });
 
   final MessageStore messageStore;
+  final DiscoveryService discoveryService;
+  final UniversalBlePeripheralChat peripheralService;
 
   @override
   State<ChatPage> createState() => _ChatPageState();
@@ -644,10 +785,51 @@ class _ChatPageState extends State<ChatPage> {
   final _controller = TextEditingController();
   final _messages = <Message>[];
   bool _isLoading = true;
+  StreamSubscription<BlePacket>? _centralPackets;
+  StreamSubscription<PeripheralBlePacket>? _peripheralPackets;
+  String? _peripheralPeerId;
+  final Set<String> _disconnectedPeripheralPeers = <String>{};
 
   @override
   void initState() {
     super.initState();
+    _centralPackets = widget.discoveryService.incomingPackets.listen(
+      (packet) => unawaited(
+        _handleIncoming(
+          packet,
+          acknowledge: widget.discoveryService.sendPacket,
+        ),
+      ),
+    );
+    _peripheralPackets = widget.peripheralService.incomingPackets.listen((
+      incoming,
+    ) {
+      try {
+        final packet = BlePacket.decode(incoming.bytes);
+        final isPairingRequest =
+            packet.type == BlePacketType.hello &&
+            packet.id == 'pairing-request';
+        if (_disconnectedPeripheralPeers.contains(incoming.deviceId) &&
+            !isPairingRequest) {
+          return;
+        }
+        if (isPairingRequest) {
+          _disconnectedPeripheralPeers.remove(incoming.deviceId);
+        }
+        _setPeripheralPeer(incoming.deviceId);
+        unawaited(
+          _handleIncoming(
+            packet,
+            acknowledge: (acknowledgement) => widget.peripheralService.send(
+              incoming.deviceId,
+              acknowledgement,
+            ),
+          ),
+        );
+      } on FormatException {
+        // 忽略不属于静域协议的损坏包。
+      }
+    });
     _loadMessages();
   }
 
@@ -690,6 +872,8 @@ class _ChatPageState extends State<ChatPage> {
 
   @override
   void dispose() {
+    _centralPackets?.cancel();
+    _peripheralPackets?.cancel();
     _controller.dispose();
     super.dispose();
   }
@@ -711,18 +895,18 @@ class _ChatPageState extends State<ChatPage> {
                   ),
                 ),
                 const SizedBox(width: 12),
-                const Expanded(
+                Expanded(
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      Text(
+                      const Text(
                         '附近设备',
                         style: TextStyle(fontWeight: FontWeight.w700),
                       ),
-                      SizedBox(height: 2),
+                      const SizedBox(height: 2),
                       Text(
-                        '模拟会话 · 离线',
-                        style: TextStyle(
+                        _isConnected ? '已连接 · 蓝牙离线通道' : '等待连接 · 离线',
+                        style: const TextStyle(
                           fontSize: 12,
                           color: Color(0xFF75849A),
                         ),
@@ -730,8 +914,29 @@ class _ChatPageState extends State<ChatPage> {
                     ],
                   ),
                 ),
-                IconButton(
-                  onPressed: () {},
+                PopupMenuButton<_ChatMenuAction>(
+                  tooltip: '聊天选项',
+                  onSelected: (action) {
+                    if (action == _ChatMenuAction.disconnect) {
+                      unawaited(_disconnect());
+                    }
+                  },
+                  itemBuilder: (context) => [
+                    PopupMenuItem<_ChatMenuAction>(
+                      value: _ChatMenuAction.disconnect,
+                      enabled: _isConnected,
+                      child: const Row(
+                        children: [
+                          Icon(
+                            Icons.link_off_rounded,
+                            color: Color(0xFFD94A4A),
+                          ),
+                          SizedBox(width: 12),
+                          Text('断开连接'),
+                        ],
+                      ),
+                    ),
+                  ],
                   icon: const Icon(Icons.more_horiz_rounded),
                 ),
               ],
@@ -756,6 +961,54 @@ class _ChatPageState extends State<ChatPage> {
     );
   }
 
+  bool get _isConnected =>
+      widget.discoveryService.isConnected || _peripheralPeerId != null;
+
+  void _setPeripheralPeer(String deviceId) {
+    if (_peripheralPeerId == deviceId) return;
+    if (mounted) {
+      setState(() => _peripheralPeerId = deviceId);
+    } else {
+      _peripheralPeerId = deviceId;
+    }
+  }
+
+  Future<void> _disconnect() async {
+    final centralConnected = widget.discoveryService.isConnected;
+    final peripheralPeerId = _peripheralPeerId;
+    if (!centralConnected && peripheralPeerId == null) return;
+
+    const disconnectPacket = BlePacket(
+      type: BlePacketType.hello,
+      id: 'disconnect-request',
+      payload: '',
+    );
+    try {
+      if (centralConnected) {
+        // 先通知对端更新界面，再关闭本机的 GATT 连接。
+        await widget.discoveryService.sendPacket(disconnectPacket);
+        await widget.discoveryService.disconnect();
+      }
+      if (peripheralPeerId != null) {
+        await widget.peripheralService.send(peripheralPeerId, disconnectPacket);
+        _disconnectedPeripheralPeers.add(peripheralPeerId);
+      }
+      if (mounted) {
+        setState(() => _peripheralPeerId = null);
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(const SnackBar(content: Text('已断开当前静域连接')));
+      }
+    } on Object {
+      if (mounted) {
+        setState(() => _peripheralPeerId = null);
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(const SnackBar(content: Text('连接已在本机断开')));
+      }
+    }
+  }
+
   void _sendMessage() {
     final text = _controller.text.trim();
     if (text.isEmpty) return;
@@ -772,19 +1025,7 @@ class _ChatPageState extends State<ChatPage> {
     });
     unawaited(widget.messageStore.saveMessage(message));
 
-    Timer(const Duration(milliseconds: 450), () {
-      if (!mounted) return;
-      final index = _messages.indexWhere((item) => item.id == message.id);
-      if (index == -1) return;
-      setState(() {
-        _messages[index] = message.copyWith(
-          status: text.contains('失败')
-              ? MessageStatus.failed
-              : MessageStatus.success,
-        );
-      });
-      unawaited(widget.messageStore.saveMessage(_messages[index]));
-    });
+    unawaited(_transmit(message));
   }
 
   void _retryMessage(Message message) {
@@ -794,21 +1035,103 @@ class _ChatPageState extends State<ChatPage> {
       _messages[index] = message.copyWith(status: MessageStatus.sending);
     });
     unawaited(widget.messageStore.saveMessage(_messages[index]));
-    Timer(const Duration(milliseconds: 450), () {
-      if (!mounted) return;
-      final currentIndex = _messages.indexWhere(
-        (item) => item.id == message.id,
+    unawaited(_transmit(_messages[index]));
+  }
+
+  Future<void> _transmit(Message message) async {
+    try {
+      final packet = BlePacket.fromMessage(message);
+      if (widget.discoveryService.isConnected) {
+        await widget.discoveryService.sendPacket(packet);
+      } else {
+        final peerId = _peripheralPeerId;
+        if (peerId == null) throw StateError('尚未建立静域通信通道');
+        await widget.peripheralService.send(peerId, packet);
+      }
+      await Future<void>.delayed(const Duration(seconds: 12));
+      _markFailedIfPending(message.id);
+    } on Object {
+      _markFailedIfPending(message.id);
+    }
+  }
+
+  Future<void> _handleIncoming(
+    BlePacket packet, {
+    required Future<void> Function(BlePacket acknowledgement) acknowledge,
+  }) async {
+    if (packet.type == BlePacketType.hello &&
+        packet.id == 'disconnect-request') {
+      await _handleRemoteDisconnect();
+      return;
+    }
+    if (packet.type == BlePacketType.acknowledgement &&
+        packet.payload == 'delivered') {
+      _markSuccess(packet.id);
+      return;
+    }
+    if (packet.type != BlePacketType.message) return;
+    try {
+      final payload = jsonDecode(packet.payload) as Map<String, dynamic>;
+      final message = Message(
+        id: packet.id,
+        sender: 'nearby-device',
+        content: payload['content'] as String,
+        timestamp: DateTime.parse(payload['timestamp'] as String),
       );
-      if (currentIndex == -1) return;
-      setState(() {
-        _messages[currentIndex] = _messages[currentIndex].copyWith(
-          status: MessageStatus.success,
-        );
-      });
-      unawaited(widget.messageStore.saveMessage(_messages[currentIndex]));
-    });
+      if (mounted && !_messages.any((item) => item.id == message.id)) {
+        setState(() => _messages.add(message));
+        await widget.messageStore.saveMessage(message);
+      }
+      await acknowledge(
+        BlePacket(
+          type: BlePacketType.acknowledgement,
+          id: packet.id,
+          payload: 'delivered',
+        ),
+      );
+    } on FormatException {
+      // 丢弃无效消息包，保持会话可用。
+    }
+  }
+
+  Future<void> _handleRemoteDisconnect() async {
+    final peerId = _peripheralPeerId;
+    if (peerId != null) _disconnectedPeripheralPeers.add(peerId);
+    if (widget.discoveryService.isConnected) {
+      await widget.discoveryService.disconnect();
+    }
+    if (!mounted) return;
+    setState(() => _peripheralPeerId = null);
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(const SnackBar(content: Text('对方已断开连接')));
+  }
+
+  void _markSuccess(String id) {
+    _updateMessageStatus(id, MessageStatus.success);
+  }
+
+  void _markFailedIfPending(String id) {
+    final message = _messages.cast<Message?>().firstWhere(
+      (item) => item?.id == id,
+      orElse: () => null,
+    );
+    if (message?.status == MessageStatus.sending) {
+      _updateMessageStatus(id, MessageStatus.failed);
+    }
+  }
+
+  void _updateMessageStatus(String id, MessageStatus status) {
+    if (!mounted) return;
+    final index = _messages.indexWhere((item) => item.id == id);
+    if (index == -1) return;
+    final updated = _messages[index].copyWith(status: status);
+    setState(() => _messages[index] = updated);
+    unawaited(widget.messageStore.saveMessage(updated));
   }
 }
+
+enum _ChatMenuAction { disconnect }
 
 class SettingsPage extends StatelessWidget {
   const SettingsPage({super.key});

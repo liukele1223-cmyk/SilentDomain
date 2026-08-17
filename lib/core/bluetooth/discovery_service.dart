@@ -2,6 +2,9 @@ import 'dart:async';
 
 import 'package:universal_ble/universal_ble.dart';
 
+import 'ble_protocol.dart';
+import 'universal_ble_chat_session.dart';
+
 class NearbyDevice {
   const NearbyDevice({required this.id, required this.name, this.rssi});
 
@@ -13,13 +16,19 @@ class NearbyDevice {
 abstract interface class DiscoveryService {
   Stream<List<NearbyDevice>> get devices;
 
+  Stream<BlePacket> get incomingPackets;
+
+  bool get isConnected;
+
   Future<void> startScan();
 
   Future<void> stopScan();
 
-  Future<void> connect(NearbyDevice device);
+  Future<void> connect(NearbyDevice device, {required String verificationCode});
 
   Future<void> disconnect();
+
+  Future<void> sendPacket(BlePacket packet);
 
   Future<void> dispose();
 }
@@ -29,19 +38,41 @@ class BleDiscoveryService implements DiscoveryService {
   BleDiscoveryService() {
     _scanSubscription = UniversalBle.scanStream.listen((device) {
       final name = (device.name ?? device.rawName ?? '').trim();
-      if (name.isEmpty) return;
-      _devicesController.add([
-        NearbyDevice(id: device.deviceId, name: name, rssi: device.rssi),
-      ]);
+      // 仅显示广播静域专用服务 UUID 的设备。真正的服务 UUID 现在会被
+      // Android 外围端写入广播包，因此手环和耳机不会出现在结果中。
+      final isSilentDomain = device.services.any(
+        (uuid) =>
+            BleUuidParser.compareStrings(uuid, SilentDomainBleUuid.service),
+      );
+      if (!isSilentDomain) return;
+      _discoveredDevices[device.deviceId] = NearbyDevice(
+        id: device.deviceId,
+        name: name.isEmpty ? '静域设备' : name,
+        rssi: device.rssi,
+      );
+      final devices = _discoveredDevices.values.toList()
+        ..sort((a, b) => (b.rssi ?? -999).compareTo(a.rssi ?? -999));
+      _devicesController.add(List.unmodifiable(devices));
     });
   }
 
   final _devicesController = StreamController<List<NearbyDevice>>.broadcast();
+  final _incomingPacketsController = StreamController<BlePacket>.broadcast();
+  final Map<String, NearbyDevice> _discoveredDevices = <String, NearbyDevice>{};
   StreamSubscription<BleDevice>? _scanSubscription;
+  Timer? _scanTimer;
   String? _connectedDeviceId;
+  UniversalBleChatSession? _chatSession;
+  StreamSubscription<List<int>>? _incomingSubscription;
 
   @override
   Stream<List<NearbyDevice>> get devices => _devicesController.stream;
+
+  @override
+  Stream<BlePacket> get incomingPackets => _incomingPacketsController.stream;
+
+  @override
+  bool get isConnected => _chatSession != null;
 
   @override
   Future<void> startScan() async {
@@ -50,18 +81,71 @@ class BleDiscoveryService implements DiscoveryService {
     if (state != AvailabilityState.poweredOn) {
       throw StateError('请先打开蓝牙');
     }
-    await UniversalBle.startScan();
-    Timer(const Duration(seconds: 12), stopScan);
+    _discoveredDevices.clear();
+    _devicesController.add(const []);
+    await UniversalBle.startScan(
+      scanFilter: ScanFilter(withServices: [SilentDomainBleUuid.service]),
+    );
+    _scanTimer?.cancel();
+    _scanTimer = Timer(const Duration(seconds: 12), stopScan);
   }
 
   @override
-  Future<void> stopScan() => UniversalBle.stopScan();
+  Future<void> stopScan() async {
+    _scanTimer?.cancel();
+    _scanTimer = null;
+    await UniversalBle.stopScan();
+  }
 
   @override
-  Future<void> connect(NearbyDevice device) async {
+  Future<void> connect(
+    NearbyDevice device, {
+    required String verificationCode,
+  }) async {
     await _ensurePermissions();
     await UniversalBle.connect(device.id, timeout: const Duration(seconds: 15));
-    _connectedDeviceId = device.id;
+    UniversalBleChatSession? session;
+    try {
+      // 先打开写入通道，将验证码请求送达广播端；通知订阅可随后建立。
+      session = await UniversalBleChatSession.open(device.id);
+      final acknowledgement = session.incomingBytes
+          .map(_decodePacketOrNull)
+          .where((packet) => packet != null)
+          .cast<BlePacket>()
+          .firstWhere(
+            (packet) =>
+                packet.type == BlePacketType.acknowledgement &&
+                packet.payload == verificationCode,
+          )
+          .timeout(const Duration(seconds: 30));
+      await session.send(
+        BlePacket(
+          type: BlePacketType.hello,
+          id: 'pairing-request',
+          payload: verificationCode,
+        ),
+      );
+      await session.subscribeNotifications();
+      await acknowledgement;
+      _chatSession = session;
+      _connectedDeviceId = device.id;
+      _incomingSubscription = session.incomingBytes.listen((bytes) {
+        final packet = _decodePacketOrNull(bytes);
+        if (packet != null) _incomingPacketsController.add(packet);
+      });
+    } on Object {
+      await session?.close();
+      await UniversalBle.disconnect(device.id);
+      rethrow;
+    }
+  }
+
+  BlePacket? _decodePacketOrNull(List<int> bytes) {
+    try {
+      return BlePacket.decode(bytes);
+    } on FormatException {
+      return null;
+    }
   }
 
   Future<void> _ensurePermissions() async {
@@ -77,14 +161,28 @@ class BleDiscoveryService implements DiscoveryService {
   @override
   Future<void> disconnect() async {
     final id = _connectedDeviceId;
+    await _incomingSubscription?.cancel();
+    _incomingSubscription = null;
+    await _chatSession?.close();
+    _chatSession = null;
     if (id != null) await UniversalBle.disconnect(id);
     _connectedDeviceId = null;
   }
 
   @override
+  Future<void> sendPacket(BlePacket packet) async {
+    final session = _chatSession;
+    if (session == null) throw StateError('尚未建立静域通信通道');
+    await session.send(packet);
+  }
+
+  @override
   Future<void> dispose() async {
+    await disconnect();
+    _scanTimer?.cancel();
     await _scanSubscription?.cancel();
     await _devicesController.close();
+    await _incomingPacketsController.close();
   }
 }
 
@@ -95,9 +193,17 @@ class FakeDiscoveryService implements DiscoveryService {
 
   final List<NearbyDevice> _devices;
   final _controller = StreamController<List<NearbyDevice>>.broadcast();
+  final _incomingController = StreamController<BlePacket>.broadcast();
+  bool _connected = false;
 
   @override
   Stream<List<NearbyDevice>> get devices => _controller.stream;
+
+  @override
+  Stream<BlePacket> get incomingPackets => _incomingController.stream;
+
+  @override
+  bool get isConnected => _connected;
 
   @override
   Future<void> startScan() async {
@@ -108,13 +214,27 @@ class FakeDiscoveryService implements DiscoveryService {
   Future<void> stopScan() async {}
 
   @override
-  Future<void> connect(NearbyDevice device) async {
+  Future<void> connect(
+    NearbyDevice device, {
+    required String verificationCode,
+  }) async {
     await Future<void>.delayed(const Duration(milliseconds: 250));
+    _connected = true;
   }
 
   @override
-  Future<void> disconnect() async {}
+  Future<void> disconnect() async {
+    _connected = false;
+  }
 
   @override
-  Future<void> dispose() => _controller.close();
+  Future<void> sendPacket(BlePacket packet) async {
+    _incomingController.add(packet);
+  }
+
+  @override
+  Future<void> dispose() async {
+    await _controller.close();
+    await _incomingController.close();
+  }
 }
