@@ -2,6 +2,8 @@ import 'dart:async';
 
 import 'package:flutter/material.dart';
 
+import 'models/message.dart';
+
 void main() => runApp(const SilentDomainApp());
 
 class SilentDomainApp extends StatelessWidget {
@@ -244,9 +246,26 @@ class ChatPage extends StatefulWidget {
 
 class _ChatPageState extends State<ChatPage> {
   final _controller = TextEditingController();
-  final _messages = <_ChatMessage>[
-    const _ChatMessage(text: '欢迎来到静域。', isMine: false, time: '09:41'),
-    const _ChatMessage(text: '这里不需要互联网。', isMine: true, time: '09:42'),
+  final _messages = <Message>[
+    Message(
+      id: 'welcome',
+      sender: 'nearby-device',
+      content: '欢迎来到静域。',
+      timestamp: DateTime(2026, 1, 1, 9, 41),
+    ),
+    Message(
+      id: 'offline',
+      sender: 'self',
+      content: '这里不需要互联网。',
+      timestamp: DateTime(2026, 1, 1, 9, 42),
+    ),
+    Message(
+      id: 'failed-demo',
+      sender: 'self',
+      content: '这是一条发送失败的消息',
+      timestamp: DateTime(2026, 1, 1, 9, 43),
+      status: MessageStatus.failed,
+    ),
   ];
 
   @override
@@ -303,8 +322,10 @@ class _ChatPageState extends State<ChatPage> {
             child: ListView.builder(
               padding: const EdgeInsets.fromLTRB(18, 22, 18, 18),
               itemCount: _messages.length,
-              itemBuilder: (_, index) =>
-                  _MessageBubble(message: _messages[index]),
+              itemBuilder: (_, index) => _MessageBubble(
+                message: _messages[index],
+                onRetry: () => _retryMessage(_messages[index]),
+              ),
             ),
           ),
           _Composer(controller: _controller, onSend: _sendMessage),
@@ -316,9 +337,49 @@ class _ChatPageState extends State<ChatPage> {
   void _sendMessage() {
     final text = _controller.text.trim();
     if (text.isEmpty) return;
+    final message = Message(
+      id: DateTime.now().microsecondsSinceEpoch.toString(),
+      sender: 'self',
+      content: text,
+      timestamp: DateTime.now(),
+      status: MessageStatus.sending,
+    );
     setState(() {
-      _messages.add(_ChatMessage(text: text, isMine: true, time: '现在'));
+      _messages.add(message);
       _controller.clear();
+    });
+
+    Timer(const Duration(milliseconds: 450), () {
+      if (!mounted) return;
+      final index = _messages.indexWhere((item) => item.id == message.id);
+      if (index == -1) return;
+      setState(() {
+        _messages[index] = message.copyWith(
+          status: text.contains('失败')
+              ? MessageStatus.failed
+              : MessageStatus.success,
+        );
+      });
+    });
+  }
+
+  void _retryMessage(Message message) {
+    final index = _messages.indexWhere((item) => item.id == message.id);
+    if (index == -1) return;
+    setState(() {
+      _messages[index] = message.copyWith(status: MessageStatus.sending);
+    });
+    Timer(const Duration(milliseconds: 450), () {
+      if (!mounted) return;
+      final currentIndex = _messages.indexWhere(
+        (item) => item.id == message.id,
+      );
+      if (currentIndex == -1) return;
+      setState(() {
+        _messages[currentIndex] = _messages[currentIndex].copyWith(
+          status: MessageStatus.success,
+        );
+      });
     });
   }
 }
@@ -532,13 +593,16 @@ class _Composer extends StatelessWidget {
 }
 
 class _MessageBubble extends StatelessWidget {
-  const _MessageBubble({required this.message});
+  const _MessageBubble({required this.message, required this.onRetry});
 
-  final _ChatMessage message;
+  final Message message;
+  final VoidCallback onRetry;
 
   @override
   Widget build(BuildContext context) {
-    final mine = message.isMine;
+    final mine = message.sender == 'self';
+    final time =
+        '${message.timestamp.hour.toString().padLeft(2, '0')}:${message.timestamp.minute.toString().padLeft(2, '0')}';
     return Align(
       alignment: mine ? Alignment.centerRight : Alignment.centerLeft,
       child: Padding(
@@ -548,24 +612,50 @@ class _MessageBubble extends StatelessWidget {
               ? CrossAxisAlignment.end
               : CrossAxisAlignment.start,
           children: [
-            Container(
-              constraints: const BoxConstraints(maxWidth: 290),
-              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-              decoration: BoxDecoration(
-                color: mine ? const Color(0xFF17324F) : Colors.white,
-                borderRadius: BorderRadius.circular(18),
-              ),
-              child: Text(
-                message.text,
-                style: TextStyle(
-                  color: mine ? Colors.white : const Color(0xFF24354A),
-                  height: 1.35,
+            Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Container(
+                  constraints: const BoxConstraints(maxWidth: 290),
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 16,
+                    vertical: 12,
+                  ),
+                  decoration: BoxDecoration(
+                    color: mine ? const Color(0xFF17324F) : Colors.white,
+                    borderRadius: BorderRadius.circular(18),
+                  ),
+                  child: Text(
+                    message.content,
+                    style: TextStyle(
+                      color: mine ? Colors.white : const Color(0xFF24354A),
+                      height: 1.35,
+                    ),
+                  ),
                 ),
-              ),
+                if (mine && message.status == MessageStatus.failed)
+                  IconButton(
+                    onPressed: onRetry,
+                    tooltip: '重新发送',
+                    icon: const Icon(
+                      Icons.error_outline_rounded,
+                      color: Color(0xFFD94A4A),
+                    ),
+                  ),
+                if (mine && message.status == MessageStatus.sending)
+                  const Padding(
+                    padding: EdgeInsets.only(left: 8),
+                    child: SizedBox(
+                      width: 15,
+                      height: 15,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    ),
+                  ),
+              ],
             ),
             const SizedBox(height: 5),
             Text(
-              message.time,
+              time,
               style: const TextStyle(fontSize: 11, color: Color(0xFF8897A8)),
             ),
           ],
@@ -627,16 +717,4 @@ class _SettingsTile extends StatelessWidget {
       onTap: () {},
     );
   }
-}
-
-class _ChatMessage {
-  const _ChatMessage({
-    required this.text,
-    required this.isMine,
-    required this.time,
-  });
-
-  final String text;
-  final bool isMine;
-  final String time;
 }
