@@ -3,6 +3,7 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 
 import 'core/bluetooth/discovery_service.dart';
+import 'core/bluetooth/universal_ble_peripheral_chat.dart';
 import 'core/database/message_store.dart';
 import 'models/message.dart';
 
@@ -13,6 +14,7 @@ Future<void> main() async {
     SilentDomainApp(
       messageStore: messageStore,
       discoveryService: BleDiscoveryService(),
+      peripheralService: UniversalBlePeripheralChat(),
     ),
   );
 }
@@ -22,11 +24,14 @@ class SilentDomainApp extends StatelessWidget {
     super.key,
     MessageStore? messageStore,
     DiscoveryService? discoveryService,
+    UniversalBlePeripheralChat? peripheralService,
   }) : messageStore = messageStore ?? MemoryMessageStore(),
-       discoveryService = discoveryService ?? FakeDiscoveryService();
+       discoveryService = discoveryService ?? FakeDiscoveryService(),
+       peripheralService = peripheralService ?? UniversalBlePeripheralChat();
 
   final MessageStore messageStore;
   final DiscoveryService discoveryService;
+  final UniversalBlePeripheralChat peripheralService;
 
   @override
   Widget build(BuildContext context) {
@@ -53,6 +58,7 @@ class SilentDomainApp extends StatelessWidget {
       home: SplashPage(
         messageStore: messageStore,
         discoveryService: discoveryService,
+        peripheralService: peripheralService,
       ),
     );
   }
@@ -62,11 +68,13 @@ class SplashPage extends StatefulWidget {
   const SplashPage({
     required this.messageStore,
     required this.discoveryService,
+    required this.peripheralService,
     super.key,
   });
 
   final MessageStore messageStore;
   final DiscoveryService discoveryService;
+  final UniversalBlePeripheralChat peripheralService;
 
   @override
   State<SplashPage> createState() => _SplashPageState();
@@ -92,6 +100,7 @@ class _SplashPageState extends State<SplashPage>
             builder: (_) => AppShell(
               messageStore: widget.messageStore,
               discoveryService: widget.discoveryService,
+              peripheralService: widget.peripheralService,
             ),
           ),
         );
@@ -143,11 +152,13 @@ class AppShell extends StatefulWidget {
   const AppShell({
     required this.messageStore,
     required this.discoveryService,
+    required this.peripheralService,
     super.key,
   });
 
   final MessageStore messageStore;
   final DiscoveryService discoveryService;
+  final UniversalBlePeripheralChat peripheralService;
 
   @override
   State<AppShell> createState() => _AppShellState();
@@ -159,7 +170,10 @@ class _AppShellState extends State<AppShell> {
   @override
   Widget build(BuildContext context) {
     final pages = [
-      HomePage(discoveryService: widget.discoveryService),
+      HomePage(
+        discoveryService: widget.discoveryService,
+        peripheralService: widget.peripheralService,
+      ),
       ChatPage(messageStore: widget.messageStore),
       const SettingsPage(),
     ];
@@ -188,12 +202,31 @@ class _AppShellState extends State<AppShell> {
       ),
     );
   }
+
+  @override
+  void dispose() {
+    widget.peripheralService.dispose();
+    super.dispose();
+  }
 }
 
-class HomePage extends StatelessWidget {
-  const HomePage({required this.discoveryService, super.key});
+class HomePage extends StatefulWidget {
+  const HomePage({
+    required this.discoveryService,
+    required this.peripheralService,
+    super.key,
+  });
 
   final DiscoveryService discoveryService;
+  final UniversalBlePeripheralChat peripheralService;
+
+  @override
+  State<HomePage> createState() => _HomePageState();
+}
+
+class _HomePageState extends State<HomePage> {
+  bool _broadcasting = false;
+  String? _broadcastError;
 
   @override
   Widget build(BuildContext context) {
@@ -231,6 +264,16 @@ class HomePage extends StatelessWidget {
             ),
           ),
           SliverPadding(
+            padding: const EdgeInsets.fromLTRB(24, 0, 24, 20),
+            sliver: SliverToBoxAdapter(
+              child: _BroadcastCard(
+                broadcasting: _broadcasting,
+                error: _broadcastError,
+                onPressed: _toggleBroadcast,
+              ),
+            ),
+          ),
+          SliverPadding(
             padding: const EdgeInsets.symmetric(horizontal: 24),
             sliver: SliverToBoxAdapter(
               child: Text(
@@ -260,7 +303,84 @@ class HomePage extends StatelessWidget {
     showModalBottomSheet<void>(
       context: context,
       showDragHandle: true,
-      builder: (_) => DeviceDiscoverySheet(service: discoveryService),
+      builder: (_) => DeviceDiscoverySheet(service: widget.discoveryService),
+    );
+  }
+
+  Future<void> _toggleBroadcast() async {
+    setState(() => _broadcastError = null);
+    try {
+      if (_broadcasting) {
+        await widget.peripheralService.stop();
+      } else {
+        await widget.peripheralService.initialize();
+      }
+      if (mounted) setState(() => _broadcasting = !_broadcasting);
+    } on Object catch (error) {
+      if (mounted) {
+        setState(() => _broadcastError = error.toString());
+      }
+    }
+  }
+}
+
+class _BroadcastCard extends StatelessWidget {
+  const _BroadcastCard({
+    required this.broadcasting,
+    required this.error,
+    required this.onPressed,
+  });
+
+  final bool broadcasting;
+  final String? error;
+  final VoidCallback onPressed;
+
+  @override
+  Widget build(BuildContext context) {
+    return Card(
+      elevation: 0,
+      color: broadcasting ? const Color(0xFFE5F4EC) : Colors.white,
+      child: Padding(
+        padding: const EdgeInsets.all(18),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                Icon(
+                  broadcasting
+                      ? Icons.wifi_tethering_rounded
+                      : Icons.wifi_tethering_outlined,
+                  color: broadcasting
+                      ? const Color(0xFF2D8A59)
+                      : const Color(0xFF477AA9),
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: Text(
+                    broadcasting ? '正在广播，可被附近设备发现' : '让附近设备发现我',
+                    style: Theme.of(context).textTheme.titleMedium?.copyWith(
+                      fontWeight: FontWeight.w700,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+            if (error != null) ...[
+              const SizedBox(height: 8),
+              Text(error!, style: const TextStyle(color: Color(0xFFD94A4A))),
+            ],
+            const SizedBox(height: 12),
+            OutlinedButton.icon(
+              onPressed: onPressed,
+              icon: Icon(
+                broadcasting ? Icons.stop_rounded : Icons.bluetooth_rounded,
+              ),
+              label: Text(broadcasting ? '停止广播' : '开始广播'),
+            ),
+          ],
+        ),
+      ),
     );
   }
 }
