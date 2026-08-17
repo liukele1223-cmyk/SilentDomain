@@ -7,6 +7,7 @@
 
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:universal_ble/universal_ble.dart';
 
 import 'package:silent_domain/core/bluetooth/discovery_service.dart';
 import 'package:silent_domain/core/bluetooth/ble_protocol.dart';
@@ -119,5 +120,17 @@ void main() {
       frames.every((frame) => frame.length <= BleFrameCodec.payloadSize),
       isTrue,
     );
+  });
+
+  test('BLE UUID 合同稳定且大小写不敏感', () {
+    expect(
+      BleUuidParser.compareStrings(
+        SilentDomainBleUuid.service,
+        '7E3A0001-4B9A-4C1D-9E2A-53494C454E54',
+      ),
+      isTrue,
+    );
+    expect(SilentDomainBleUuid.writeCharacteristic, isNotEmpty);
+    expect(SilentDomainBleUuid.notifyCharacteristic, isNotEmpty);
   });
 }
