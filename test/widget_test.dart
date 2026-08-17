@@ -12,6 +12,7 @@ import 'package:universal_ble/universal_ble.dart';
 import 'package:silent_domain/core/bluetooth/discovery_service.dart';
 import 'package:silent_domain/core/bluetooth/ble_protocol.dart';
 import 'package:silent_domain/core/database/message_store.dart';
+import 'package:silent_domain/core/security/device_identity_service.dart';
 import 'package:silent_domain/models/message.dart';
 import 'package:silent_domain/main.dart';
 
@@ -141,5 +142,33 @@ void main() {
     );
     expect(SilentDomainBleUuid.writeCharacteristic, isNotEmpty);
     expect(SilentDomainBleUuid.notifyCharacteristic, isNotEmpty);
+  });
+
+  test('ECDH 双方派生相同 AES-256-GCM 会话密钥并拒绝篡改', () async {
+    final first = await EphemeralSessionKey.create();
+    final second = await EphemeralSessionKey.create();
+    const transcript = 'verified-pairing-transcript';
+    final firstCipher = await first.deriveSessionCipher(
+      remotePublicKey: second.publicKey,
+      transcript: transcript,
+    );
+    final secondCipher = await second.deriveSessionCipher(
+      remotePublicKey: first.publicKey,
+      transcript: transcript,
+    );
+
+    final encrypted = await firstCipher.encrypt(
+      '只在离线通道中可见',
+      authenticatedData: 'message-001',
+    );
+    expect(encrypted.ciphertext, isNot('只在离线通道中可见'));
+    expect(
+      await secondCipher.decrypt(encrypted, authenticatedData: 'message-001'),
+      '只在离线通道中可见',
+    );
+    await expectLater(
+      secondCipher.decrypt(encrypted, authenticatedData: 'message-002'),
+      throwsA(anything),
+    );
   });
 }
