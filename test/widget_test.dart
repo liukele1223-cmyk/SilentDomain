@@ -9,6 +9,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 import 'package:silent_domain/core/bluetooth/discovery_service.dart';
+import 'package:silent_domain/core/bluetooth/ble_protocol.dart';
 import 'package:silent_domain/core/database/message_store.dart';
 import 'package:silent_domain/models/message.dart';
 import 'package:silent_domain/main.dart';
@@ -96,5 +97,27 @@ void main() {
 
     expect(messages, hasLength(1));
     expect(messages.single.content, '本地保存测试');
+  });
+
+  test('BLE 数据包可以编码、解码并分片重组', () {
+    final packet = BlePacket(
+      type: BlePacketType.message,
+      id: 'packet-1',
+      payload: '一段需要通过 BLE 传输的消息内容',
+    );
+    final encoded = packet.encode();
+    final decoded = BlePacket.decode(encoded);
+    final frames = BleFrameCodec.split(encoded);
+    final restored = frames
+        .expand((frame) => BleFrameCodec.decode(frame).payload)
+        .toList();
+
+    expect(decoded.id, packet.id);
+    expect(decoded.payload, packet.payload);
+    expect(restored, encoded);
+    expect(
+      frames.every((frame) => frame.length <= BleFrameCodec.payloadSize),
+      isTrue,
+    );
   });
 }
