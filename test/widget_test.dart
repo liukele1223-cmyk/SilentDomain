@@ -8,6 +8,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 
+import 'package:silent_domain/core/bluetooth/discovery_service.dart';
 import 'package:silent_domain/core/database/message_store.dart';
 import 'package:silent_domain/models/message.dart';
 import 'package:silent_domain/main.dart';
@@ -36,6 +37,21 @@ void main() {
     expect(find.byType(CircularProgressIndicator), findsOneWidget);
     await tester.pump(const Duration(milliseconds: 500));
     expect(find.byIcon(Icons.error_outline_rounded), findsNothing);
+  });
+
+  testWidgets('首页可以打开 BLE 设备发现面板', (WidgetTester tester) async {
+    await tester.pumpWidget(
+      SilentDomainApp(discoveryService: FakeDiscoveryService()),
+    );
+    await tester.pump(const Duration(milliseconds: 1600));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('发现设备').first);
+    await tester.pumpAndSettle();
+
+    expect(find.text('发现附近设备'), findsOneWidget);
+    await tester.tap(find.text('开始搜索'));
+    await tester.pumpAndSettle();
+    expect(find.text('暂未发现设备'), findsOneWidget);
   });
 
   test('Message copyWith 保留未修改字段', () {

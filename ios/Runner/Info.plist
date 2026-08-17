@@ -51,6 +51,10 @@
 	<true/>
 	<key>UILaunchStoryboardName</key>
 	<string>LaunchScreen</string>
+	<key>NSBluetoothAlwaysUsageDescription</key>
+	<string>静域需要使用蓝牙发现附近的离线聊天设备。</string>
+	<key>NSBluetoothPeripheralUsageDescription</key>
+	<string>静域需要使用蓝牙与附近的离线聊天设备建立连接。</string>
 	<key>UIMainStoryboardFile</key>
 	<string>Main</string>
 	<key>UISupportedInterfaceOrientations</key>

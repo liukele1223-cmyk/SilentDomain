@@ -2,20 +2,31 @@ import 'dart:async';
 
 import 'package:flutter/material.dart';
 
+import 'core/bluetooth/discovery_service.dart';
 import 'core/database/message_store.dart';
 import 'models/message.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   final messageStore = await HiveMessageStore.create();
-  runApp(SilentDomainApp(messageStore: messageStore));
+  runApp(
+    SilentDomainApp(
+      messageStore: messageStore,
+      discoveryService: BleDiscoveryService(),
+    ),
+  );
 }
 
 class SilentDomainApp extends StatelessWidget {
-  SilentDomainApp({super.key, MessageStore? messageStore})
-    : messageStore = messageStore ?? MemoryMessageStore();
+  SilentDomainApp({
+    super.key,
+    MessageStore? messageStore,
+    DiscoveryService? discoveryService,
+  }) : messageStore = messageStore ?? MemoryMessageStore(),
+       discoveryService = discoveryService ?? FakeDiscoveryService();
 
   final MessageStore messageStore;
+  final DiscoveryService discoveryService;
 
   @override
   Widget build(BuildContext context) {
@@ -39,15 +50,23 @@ class SilentDomainApp extends StatelessWidget {
           ),
         ),
       ),
-      home: SplashPage(messageStore: messageStore),
+      home: SplashPage(
+        messageStore: messageStore,
+        discoveryService: discoveryService,
+      ),
     );
   }
 }
 
 class SplashPage extends StatefulWidget {
-  const SplashPage({required this.messageStore, super.key});
+  const SplashPage({
+    required this.messageStore,
+    required this.discoveryService,
+    super.key,
+  });
 
   final MessageStore messageStore;
+  final DiscoveryService discoveryService;
 
   @override
   State<SplashPage> createState() => _SplashPageState();
@@ -70,7 +89,10 @@ class _SplashPageState extends State<SplashPage>
       if (mounted) {
         Navigator.of(context).pushReplacement(
           MaterialPageRoute<void>(
-            builder: (_) => AppShell(messageStore: widget.messageStore),
+            builder: (_) => AppShell(
+              messageStore: widget.messageStore,
+              discoveryService: widget.discoveryService,
+            ),
           ),
         );
       }
@@ -118,9 +140,14 @@ class _SplashPageState extends State<SplashPage>
 }
 
 class AppShell extends StatefulWidget {
-  const AppShell({required this.messageStore, super.key});
+  const AppShell({
+    required this.messageStore,
+    required this.discoveryService,
+    super.key,
+  });
 
   final MessageStore messageStore;
+  final DiscoveryService discoveryService;
 
   @override
   State<AppShell> createState() => _AppShellState();
@@ -132,7 +159,7 @@ class _AppShellState extends State<AppShell> {
   @override
   Widget build(BuildContext context) {
     final pages = [
-      const HomePage(),
+      HomePage(discoveryService: widget.discoveryService),
       ChatPage(messageStore: widget.messageStore),
       const SettingsPage(),
     ];
@@ -164,7 +191,9 @@ class _AppShellState extends State<AppShell> {
 }
 
 class HomePage extends StatelessWidget {
-  const HomePage({super.key});
+  const HomePage({required this.discoveryService, super.key});
+
+  final DiscoveryService discoveryService;
 
   @override
   Widget build(BuildContext context) {
@@ -231,27 +260,104 @@ class HomePage extends StatelessWidget {
     showModalBottomSheet<void>(
       context: context,
       showDragHandle: true,
-      builder: (context) => SafeArea(
-        child: Padding(
-          padding: const EdgeInsets.fromLTRB(24, 8, 24, 28),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Text('连接附近设备', style: Theme.of(context).textTheme.titleLarge),
-              const SizedBox(height: 8),
-              const Text('阶段 1 暂使用界面演示。真实 BLE / Wi-Fi Direct 将在后续阶段接入。'),
-              const SizedBox(height: 20),
-              FilledButton.icon(
-                onPressed: () => Navigator.pop(context),
-                icon: const Icon(Icons.bluetooth_searching_rounded),
-                label: const Text('开始搜索'),
-              ),
-            ],
-          ),
+      builder: (_) => DeviceDiscoverySheet(service: discoveryService),
+    );
+  }
+}
+
+class DeviceDiscoverySheet extends StatefulWidget {
+  const DeviceDiscoverySheet({required this.service, super.key});
+
+  final DiscoveryService service;
+
+  @override
+  State<DeviceDiscoverySheet> createState() => _DeviceDiscoverySheetState();
+}
+
+class _DeviceDiscoverySheetState extends State<DeviceDiscoverySheet> {
+  bool _isScanning = false;
+  String? _error;
+
+  @override
+  Widget build(BuildContext context) {
+    return SafeArea(
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(24, 8, 24, 28),
+        child: StreamBuilder<List<NearbyDevice>>(
+          stream: widget.service.devices,
+          initialData: const [],
+          builder: (context, snapshot) {
+            final devices = snapshot.data ?? const <NearbyDevice>[];
+            return Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text('发现附近设备', style: Theme.of(context).textTheme.titleLarge),
+                const SizedBox(height: 8),
+                const Text('静域使用蓝牙低功耗发现附近设备，不需要互联网。'),
+                if (_error != null) ...[
+                  const SizedBox(height: 12),
+                  Text(
+                    _error!,
+                    style: const TextStyle(color: Color(0xFFD94A4A)),
+                  ),
+                ],
+                const SizedBox(height: 18),
+                if (devices.isEmpty && !_isScanning)
+                  const Padding(
+                    padding: EdgeInsets.symmetric(vertical: 18),
+                    child: Text('暂未发现设备'),
+                  ),
+                for (final device in devices)
+                  ListTile(
+                    contentPadding: EdgeInsets.zero,
+                    leading: const CircleAvatar(
+                      backgroundColor: Color(0xFFDDEBFA),
+                      child: Icon(
+                        Icons.phone_android_rounded,
+                        color: Color(0xFF477AA9),
+                      ),
+                    ),
+                    title: Text(device.name),
+                    subtitle: Text('信号强度 ${device.rssi ?? '--'} dBm'),
+                    trailing: const Icon(Icons.chevron_right_rounded),
+                    onTap: () {},
+                  ),
+                FilledButton.icon(
+                  onPressed: _isScanning ? null : _startScan,
+                  icon: _isScanning
+                      ? const SizedBox(
+                          width: 18,
+                          height: 18,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        )
+                      : const Icon(Icons.bluetooth_searching_rounded),
+                  label: Text(_isScanning ? '正在搜索…' : '开始搜索'),
+                ),
+              ],
+            );
+          },
         ),
       ),
     );
+  }
+
+  Future<void> _startScan() async {
+    setState(() {
+      _isScanning = true;
+      _error = null;
+    });
+    try {
+      await widget.service.startScan();
+    } on Object catch (error) {
+      if (mounted) {
+        setState(
+          () => _error = error.toString().replaceFirst('Bad state: ', ''),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _isScanning = false);
+    }
   }
 }
 
