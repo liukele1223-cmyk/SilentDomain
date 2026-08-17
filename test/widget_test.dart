@@ -163,6 +163,10 @@ void main() {
     );
     expect(encrypted.ciphertext, isNot('只在离线通道中可见'));
     expect(
+      EncryptedPayload.fromCompact(encrypted.toCompact()).ciphertext,
+      encrypted.ciphertext,
+    );
+    expect(
       await secondCipher.decrypt(encrypted, authenticatedData: 'message-001'),
       '只在离线通道中可见',
     );

@@ -4,6 +4,8 @@ import 'dart:math';
 import 'package:cryptography/cryptography.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 
+import '../bluetooth/ble_protocol.dart';
+
 /// 设备的长期身份。
 ///
 /// 私钥种子只保存在系统安全存储（Android Keystore / iOS Keychain）的保护
@@ -205,4 +207,274 @@ class EncryptedPayload {
     }
     return EncryptedPayload(nonce: nonce, ciphertext: ciphertext, mac: mac);
   }
+
+  /// 紧凑二进制布局：12 字节 nonce + 16 字节 GCM 标签 + 密文。
+  ///
+  /// BLE 带宽有限，因此传输时避免三段 Base64 再嵌套 JSON；该表示仅执行一次
+  /// Base64URL 编码，同时保留 AES-GCM 所需的全部认证材料。
+  String toCompact() {
+    return base64Url.encode(<int>[
+      ...base64Url.decode(nonce),
+      ...base64Url.decode(mac),
+      ...base64Url.decode(ciphertext),
+    ]);
+  }
+
+  factory EncryptedPayload.fromCompact(String encoded) {
+    final bytes = base64Url.decode(encoded);
+    const nonceLength = 12;
+    const macLength = 16;
+    if (bytes.length < nonceLength + macLength) {
+      throw const FormatException('紧凑加密消息长度无效');
+    }
+    return EncryptedPayload(
+      nonce: base64Url.encode(bytes.sublist(0, nonceLength)),
+      mac: base64Url.encode(
+        bytes.sublist(nonceLength, nonceLength + macLength),
+      ),
+      ciphertext: base64Url.encode(bytes.sublist(nonceLength + macLength)),
+    );
+  }
+}
+
+/// 配对阶段交换的公开材料。内容不含聊天正文或任何用户个人资料。
+class SecureHandshakePayload {
+  const SecureHandshakePayload({
+    required this.verificationCode,
+    required this.deviceId,
+    required this.identityPublicKey,
+    required this.sessionPublicKey,
+    required this.signature,
+  });
+
+  final String verificationCode;
+  final String deviceId;
+  final String identityPublicKey;
+  final String sessionPublicKey;
+  final String signature;
+
+  Map<String, String> toJson() => {
+    'code': verificationCode,
+    'deviceId': deviceId,
+    'identityPublicKey': identityPublicKey,
+    'sessionPublicKey': sessionPublicKey,
+    'signature': signature,
+  };
+
+  factory SecureHandshakePayload.fromJson(Map<String, dynamic> json) {
+    final code = json['code'];
+    final deviceId = json['deviceId'];
+    final identityPublicKey = json['identityPublicKey'];
+    final sessionPublicKey = json['sessionPublicKey'];
+    final signature = json['signature'];
+    if (code is! String ||
+        deviceId is! String ||
+        identityPublicKey is! String ||
+        sessionPublicKey is! String ||
+        signature is! String) {
+      throw const FormatException('安全握手数据格式无效');
+    }
+    return SecureHandshakePayload(
+      verificationCode: code,
+      deviceId: deviceId,
+      identityPublicKey: identityPublicKey,
+      sessionPublicKey: sessionPublicKey,
+      signature: signature,
+    );
+  }
+}
+
+/// 管理单次连接的临时会话密钥，断开后调用 [clear] 即会丢弃它们。
+class SessionSecurityRegistry {
+  SessionSecurityRegistry({DeviceIdentityService? identityService})
+    : _identityService = identityService ?? DeviceIdentityService();
+
+  final DeviceIdentityService _identityService;
+  EphemeralSessionKey? _pendingInitiatorKey;
+  String? _pendingVerificationCode;
+  SessionCipher? _centralCipher;
+  final Map<String, SessionCipher> _peripheralCiphers =
+      <String, SessionCipher>{};
+
+  bool get hasCentralSession => _centralCipher != null;
+
+  Future<SecureHandshakePayload> createInitiatorOffer(
+    String verificationCode,
+  ) async {
+    final identity = await _identityService.loadOrCreate();
+    final sessionKey = await EphemeralSessionKey.create();
+    _pendingInitiatorKey = sessionKey;
+    _pendingVerificationCode = verificationCode;
+    return SecureHandshakePayload(
+      verificationCode: verificationCode,
+      deviceId: identity.deviceId,
+      identityPublicKey: identity.publicKey,
+      sessionPublicKey: sessionKey.publicKey,
+      signature: await _identityService.signSessionPublicKey(
+        _signatureInput(verificationCode, sessionKey.publicKey),
+      ),
+    );
+  }
+
+  Future<SecureHandshakePayload> acceptInitiatorOffer({
+    required String remoteDeviceId,
+    required String encodedOffer,
+  }) async {
+    final offer = SecureHandshakePayload.fromJson(
+      jsonDecode(encodedOffer) as Map<String, dynamic>,
+    );
+    await _verifySignature(offer);
+    final identity = await _identityService.loadOrCreate();
+    final localSessionKey = await EphemeralSessionKey.create();
+    _peripheralCiphers[remoteDeviceId] = await localSessionKey
+        .deriveSessionCipher(
+          remotePublicKey: offer.sessionPublicKey,
+          transcript: _transcript(
+            offer.verificationCode,
+            localSessionKey.publicKey,
+            offer.sessionPublicKey,
+          ),
+        );
+    return SecureHandshakePayload(
+      verificationCode: offer.verificationCode,
+      deviceId: identity.deviceId,
+      identityPublicKey: identity.publicKey,
+      sessionPublicKey: localSessionKey.publicKey,
+      signature: await _identityService.signSessionPublicKey(
+        _signatureInput(offer.verificationCode, localSessionKey.publicKey),
+      ),
+    );
+  }
+
+  Future<void> completeInitiator({
+    required String expectedVerificationCode,
+    required String encodedResponse,
+  }) async {
+    final pendingKey = _pendingInitiatorKey;
+    if (pendingKey == null ||
+        _pendingVerificationCode != expectedVerificationCode) {
+      throw StateError('未找到待确认的安全会话');
+    }
+    final response = SecureHandshakePayload.fromJson(
+      jsonDecode(encodedResponse) as Map<String, dynamic>,
+    );
+    if (response.verificationCode != expectedVerificationCode) {
+      throw const FormatException('两台设备的验证码不一致');
+    }
+    await _verifySignature(response);
+    _centralCipher = await pendingKey.deriveSessionCipher(
+      remotePublicKey: response.sessionPublicKey,
+      transcript: _transcript(
+        expectedVerificationCode,
+        pendingKey.publicKey,
+        response.sessionPublicKey,
+      ),
+    );
+    _pendingInitiatorKey = null;
+    _pendingVerificationCode = null;
+  }
+
+  Future<BlePacket> encryptForCentral(BlePacket packet) async {
+    final cipher = _centralCipher;
+    if (cipher == null) throw StateError('安全会话尚未建立');
+    return _encrypt(packet, cipher);
+  }
+
+  Future<BlePacket> decryptFromCentral(BlePacket packet) async {
+    final cipher = _centralCipher;
+    if (cipher == null) throw StateError('安全会话尚未建立');
+    return _decrypt(packet, cipher);
+  }
+
+  Future<BlePacket> encryptForPeripheral(
+    String deviceId,
+    BlePacket packet,
+  ) async {
+    final cipher = _peripheralCiphers[deviceId];
+    if (cipher == null) throw StateError('安全会话尚未建立');
+    return _encrypt(packet, cipher);
+  }
+
+  Future<BlePacket> decryptFromPeripheral(
+    String deviceId,
+    BlePacket packet,
+  ) async {
+    final cipher = _peripheralCiphers[deviceId];
+    if (cipher == null) throw StateError('安全会话尚未建立');
+    return _decrypt(packet, cipher);
+  }
+
+  void clearCentralSession() {
+    _pendingInitiatorKey = null;
+    _pendingVerificationCode = null;
+    _centralCipher = null;
+  }
+
+  void clearPeripheralSession(String deviceId) {
+    _peripheralCiphers.remove(deviceId);
+  }
+
+  Future<BlePacket> _encrypt(BlePacket packet, SessionCipher cipher) async {
+    final payload = await cipher.encrypt(
+      // 外层已包含消息 ID，内部仅保留一个类型字节与实际载荷，避免重复
+      // 序列化整段 JSON，显著降低低 MTU BLE 链路上的分帧数量。
+      utf8.decode(<int>[packet.type.index, ...utf8.encode(packet.payload)]),
+      authenticatedData: _messageAad(packet.id),
+    );
+    return BlePacket(
+      type: BlePacketType.encrypted,
+      id: packet.id,
+      payload: payload.toCompact(),
+      sequence: packet.sequence,
+    );
+  }
+
+  Future<BlePacket> _decrypt(BlePacket packet, SessionCipher cipher) async {
+    if (packet.type != BlePacketType.encrypted) {
+      throw const FormatException('收到未加密的会话消息');
+    }
+    final payload = EncryptedPayload.fromCompact(packet.payload);
+    final plaintext = await cipher.decrypt(
+      payload,
+      authenticatedData: _messageAad(packet.id),
+    );
+    final plaintextBytes = utf8.encode(plaintext);
+    if (plaintextBytes.isEmpty ||
+        plaintextBytes.first >= BlePacketType.encrypted.index) {
+      throw const FormatException('加密消息类型无效');
+    }
+    return BlePacket(
+      type: BlePacketType.values[plaintextBytes.first],
+      id: packet.id,
+      payload: utf8.decode(plaintextBytes.sublist(1)),
+      sequence: packet.sequence,
+    );
+  }
+
+  Future<void> _verifySignature(SecureHandshakePayload payload) async {
+    final publicKeyBytes = base64Url.decode(payload.identityPublicKey);
+    if (publicKeyBytes.length != 32) {
+      throw const FormatException('设备身份公钥长度无效');
+    }
+    final valid = await Ed25519().verify(
+      utf8.encode(
+        _signatureInput(payload.verificationCode, payload.sessionPublicKey),
+      ),
+      signature: Signature(
+        base64Url.decode(payload.signature),
+        publicKey: SimplePublicKey(publicKeyBytes, type: KeyPairType.ed25519),
+      ),
+    );
+    if (!valid) throw const FormatException('设备身份签名校验失败');
+  }
+
+  static String _signatureInput(String code, String sessionPublicKey) =>
+      '$code|$sessionPublicKey';
+
+  static String _transcript(String code, String firstKey, String secondKey) {
+    final keys = [firstKey, secondKey]..sort();
+    return '$code|${keys.join('|')}';
+  }
+
+  static String _messageAad(String id) => 'silent-domain-message-v1|$id';
 }

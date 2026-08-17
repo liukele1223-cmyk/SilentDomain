@@ -8,9 +8,10 @@ import 'ble_protocol.dart';
 /// 中心端 GATT 会话：负责固定 UUID 下的数据收发、分帧和通知重组。
 /// 认证与端到端加密将在安全阶段接入本会话的数据入口。
 class UniversalBleChatSession implements BleChatSession {
-  UniversalBleChatSession._(this.deviceId);
+  UniversalBleChatSession._(this.deviceId, this._maxFrameSize);
 
   final String deviceId;
+  final int _maxFrameSize;
   final StreamController<List<int>> _incomingController =
       StreamController<List<int>>.broadcast();
   StreamSubscription<dynamic>? _notificationListener;
@@ -18,11 +19,15 @@ class UniversalBleChatSession implements BleChatSession {
 
   int? _frameTotal;
   final Map<int, List<int>> _frames = <int, List<int>>{};
+  Future<void> _sendQueue = Future<void>.value();
   bool _closed = false;
 
   /// 发现服务并打开会话。通知订阅由 [subscribeNotifications] 单独启动，
   /// 以便连接请求先通过写入特征抵达外围端。
-  static Future<UniversalBleChatSession> open(String deviceId) async {
+  static Future<UniversalBleChatSession> open(
+    String deviceId, {
+    int maxFrameSize = BleFrameCodec.payloadSize,
+  }) async {
     final services = await UniversalBle.discoverServices(deviceId);
     BleCharacteristic? notifyCharacteristic;
 
@@ -53,7 +58,7 @@ class UniversalBleChatSession implements BleChatSession {
       throw StateError('静域 BLE 通知特征不支持通知');
     }
 
-    final session = UniversalBleChatSession._(deviceId);
+    final session = UniversalBleChatSession._(deviceId, maxFrameSize);
     session._notificationListener = subscription.listen(
       (value) => session._handleFrame(value),
     );
@@ -99,14 +104,27 @@ class UniversalBleChatSession implements BleChatSession {
   Stream<List<int>> get incomingBytes => _incomingController.stream;
 
   @override
-  Future<void> send(BlePacket packet) async {
+  Future<void> send(BlePacket packet) {
     _ensureOpen();
-    for (final frame in BleFrameCodec.split(packet.encode())) {
+    final task = _sendQueue.then((_) => _sendFrames(packet));
+    // 后续发送不能因一条失败消息永久停在错误 Future 上。
+    _sendQueue = task.then<void>((_) {}, onError: (_, _) {});
+    return task;
+  }
+
+  Future<void> _sendFrames(BlePacket packet) async {
+    final frames = BleFrameCodec.split(
+      packet.encode(),
+      maxFrameSize: _maxFrameSize,
+    );
+    // 所有帧使用有响应写入，长消息的速度来自协商到的更大 MTU。实测当前
+    // Android 组合会丢弃无响应长写入，因此优先保证逐条消息可靠送达。
+    for (var index = 0; index < frames.length; index++) {
       await UniversalBle.write(
         deviceId,
         SilentDomainBleUuid.service,
         SilentDomainBleUuid.writeCharacteristic,
-        frame,
+        frames[index],
         withoutResponse: false,
       );
     }

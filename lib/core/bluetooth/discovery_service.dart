@@ -1,9 +1,11 @@
 import 'dart:async';
+import 'dart:convert';
 
 import 'package:universal_ble/universal_ble.dart';
 
 import 'ble_protocol.dart';
 import 'universal_ble_chat_session.dart';
+import '../security/device_identity_service.dart';
 
 class NearbyDevice {
   const NearbyDevice({required this.id, required this.name, this.rssi});
@@ -35,7 +37,8 @@ abstract interface class DiscoveryService {
 
 /// BLE 发现与连接实现，使用 BSD 3-Clause 许可的 Universal BLE。
 class BleDiscoveryService implements DiscoveryService {
-  BleDiscoveryService() {
+  BleDiscoveryService({SessionSecurityRegistry? securityRegistry})
+    : _securityRegistry = securityRegistry ?? SessionSecurityRegistry() {
     _scanSubscription = UniversalBle.scanStream.listen((device) {
       final name = (device.name ?? device.rawName ?? '').trim();
       // 仅显示广播静域专用服务 UUID 的设备。真正的服务 UUID 现在会被
@@ -58,6 +61,7 @@ class BleDiscoveryService implements DiscoveryService {
 
   final _devicesController = StreamController<List<NearbyDevice>>.broadcast();
   final _incomingPacketsController = StreamController<BlePacket>.broadcast();
+  final SessionSecurityRegistry _securityRegistry;
   final Map<String, NearbyDevice> _discoveredDevices = <String, NearbyDevice>{};
   StreamSubscription<BleDevice>? _scanSubscription;
   Timer? _scanTimer;
@@ -107,7 +111,14 @@ class BleDiscoveryService implements DiscoveryService {
     UniversalBleChatSession? session;
     try {
       // 先打开写入通道，将验证码请求送达广播端；通知订阅可随后建立。
-      session = await UniversalBleChatSession.open(device.id);
+      final maxFrameSize = await _negotiateMaxFrameSize(device.id);
+      session = await UniversalBleChatSession.open(
+        device.id,
+        maxFrameSize: maxFrameSize,
+      );
+      final offer = await _securityRegistry.createInitiatorOffer(
+        verificationCode,
+      );
       final acknowledgement = session.incomingBytes
           .map(_decodePacketOrNull)
           .where((packet) => packet != null)
@@ -115,18 +126,22 @@ class BleDiscoveryService implements DiscoveryService {
           .firstWhere(
             (packet) =>
                 packet.type == BlePacketType.acknowledgement &&
-                packet.payload == verificationCode,
+                packet.id == 'pairing-request',
           )
           .timeout(const Duration(seconds: 30));
       await session.send(
         BlePacket(
           type: BlePacketType.hello,
           id: 'pairing-request',
-          payload: verificationCode,
+          payload: jsonEncode(offer.toJson()),
         ),
       );
       await session.subscribeNotifications();
-      await acknowledgement;
+      final response = await acknowledgement;
+      await _securityRegistry.completeInitiator(
+        expectedVerificationCode: verificationCode,
+        encodedResponse: response.payload,
+      );
       _chatSession = session;
       _connectedDeviceId = device.id;
       _incomingSubscription = session.incomingBytes.listen((bytes) {
@@ -134,6 +149,7 @@ class BleDiscoveryService implements DiscoveryService {
         if (packet != null) _incomingPacketsController.add(packet);
       });
     } on Object {
+      _securityRegistry.clearCentralSession();
       await session?.close();
       await UniversalBle.disconnect(device.id);
       rethrow;
@@ -145,6 +161,21 @@ class BleDiscoveryService implements DiscoveryService {
       return BlePacket.decode(bytes);
     } on FormatException {
       return null;
+    }
+  }
+
+  Future<int> _negotiateMaxFrameSize(String deviceId) async {
+    try {
+      final mtu = await UniversalBle.requestMtu(
+        deviceId,
+        247,
+        timeout: const Duration(seconds: 4),
+      );
+      // ATT 写入值最大为 MTU - 3；244 是 Android 上兼容性良好的上限。
+      return (mtu - 3).clamp(BleFrameCodec.payloadSize, 244).toInt();
+    } on Object {
+      // MTU 协商是尽力而为。失败时安全回退到默认 20 字节帧。
+      return BleFrameCodec.payloadSize;
     }
   }
 
@@ -165,6 +196,7 @@ class BleDiscoveryService implements DiscoveryService {
     _incomingSubscription = null;
     await _chatSession?.close();
     _chatSession = null;
+    _securityRegistry.clearCentralSession();
     if (id != null) await UniversalBle.disconnect(id);
     _connectedDeviceId = null;
   }

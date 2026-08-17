@@ -10,7 +10,7 @@ abstract final class SilentDomainBleUuid {
   static const notifyCharacteristic = '7e3a0003-4b9a-4c1d-9e2a-53494c454e54';
 }
 
-enum BlePacketType { hello, message, acknowledgement }
+enum BlePacketType { hello, message, acknowledgement, encrypted }
 
 class BlePacket {
   const BlePacket({
@@ -69,8 +69,14 @@ abstract final class BleFrameCodec {
   static const payloadSize = 20;
   static const _headerSize = 4;
 
-  static List<Uint8List> split(Uint8List bytes) {
-    final chunkSize = payloadSize - _headerSize;
+  static List<Uint8List> split(
+    Uint8List bytes, {
+    int maxFrameSize = payloadSize,
+  }) {
+    if (maxFrameSize <= _headerSize) {
+      throw ArgumentError.value(maxFrameSize, 'maxFrameSize');
+    }
+    final chunkSize = maxFrameSize - _headerSize;
     final total = (bytes.length / chunkSize).ceil().clamp(1, 65535);
     return List.generate(total, (index) {
       final start = index * chunkSize;

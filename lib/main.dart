@@ -8,16 +8,19 @@ import 'core/bluetooth/discovery_service.dart';
 import 'core/bluetooth/ble_protocol.dart';
 import 'core/bluetooth/universal_ble_peripheral_chat.dart';
 import 'core/database/message_store.dart';
+import 'core/security/device_identity_service.dart';
 import 'models/message.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   final messageStore = await HiveMessageStore.create();
+  final securityRegistry = SessionSecurityRegistry();
   runApp(
     SilentDomainApp(
       messageStore: messageStore,
-      discoveryService: BleDiscoveryService(),
+      discoveryService: BleDiscoveryService(securityRegistry: securityRegistry),
       peripheralService: UniversalBlePeripheralChat(),
+      securityRegistry: securityRegistry,
     ),
   );
 }
@@ -28,13 +31,16 @@ class SilentDomainApp extends StatelessWidget {
     MessageStore? messageStore,
     DiscoveryService? discoveryService,
     UniversalBlePeripheralChat? peripheralService,
+    SessionSecurityRegistry? securityRegistry,
   }) : messageStore = messageStore ?? MemoryMessageStore(),
        discoveryService = discoveryService ?? FakeDiscoveryService(),
-       peripheralService = peripheralService ?? UniversalBlePeripheralChat();
+       peripheralService = peripheralService ?? UniversalBlePeripheralChat(),
+       securityRegistry = securityRegistry ?? SessionSecurityRegistry();
 
   final MessageStore messageStore;
   final DiscoveryService discoveryService;
   final UniversalBlePeripheralChat peripheralService;
+  final SessionSecurityRegistry securityRegistry;
 
   @override
   Widget build(BuildContext context) {
@@ -62,6 +68,7 @@ class SilentDomainApp extends StatelessWidget {
         messageStore: messageStore,
         discoveryService: discoveryService,
         peripheralService: peripheralService,
+        securityRegistry: securityRegistry,
       ),
     );
   }
@@ -72,12 +79,14 @@ class SplashPage extends StatefulWidget {
     required this.messageStore,
     required this.discoveryService,
     required this.peripheralService,
+    required this.securityRegistry,
     super.key,
   });
 
   final MessageStore messageStore;
   final DiscoveryService discoveryService;
   final UniversalBlePeripheralChat peripheralService;
+  final SessionSecurityRegistry securityRegistry;
 
   @override
   State<SplashPage> createState() => _SplashPageState();
@@ -104,6 +113,7 @@ class _SplashPageState extends State<SplashPage>
               messageStore: widget.messageStore,
               discoveryService: widget.discoveryService,
               peripheralService: widget.peripheralService,
+              securityRegistry: widget.securityRegistry,
             ),
           ),
         );
@@ -156,12 +166,14 @@ class AppShell extends StatefulWidget {
     required this.messageStore,
     required this.discoveryService,
     required this.peripheralService,
+    required this.securityRegistry,
     super.key,
   });
 
   final MessageStore messageStore;
   final DiscoveryService discoveryService;
   final UniversalBlePeripheralChat peripheralService;
+  final SessionSecurityRegistry securityRegistry;
 
   @override
   State<AppShell> createState() => _AppShellState();
@@ -176,12 +188,14 @@ class _AppShellState extends State<AppShell> {
       HomePage(
         discoveryService: widget.discoveryService,
         peripheralService: widget.peripheralService,
+        securityRegistry: widget.securityRegistry,
         onOpenChat: _openChat,
       ),
       ChatPage(
         messageStore: widget.messageStore,
         discoveryService: widget.discoveryService,
         peripheralService: widget.peripheralService,
+        securityRegistry: widget.securityRegistry,
       ),
       const SettingsPage(),
     ];
@@ -226,12 +240,14 @@ class HomePage extends StatefulWidget {
   const HomePage({
     required this.discoveryService,
     required this.peripheralService,
+    required this.securityRegistry,
     required this.onOpenChat,
     super.key,
   });
 
   final DiscoveryService discoveryService;
   final UniversalBlePeripheralChat peripheralService;
+  final SessionSecurityRegistry securityRegistry;
   final VoidCallback onOpenChat;
 
   @override
@@ -370,6 +386,21 @@ class _HomePageState extends State<HomePage> {
       return;
     }
 
+    SecureHandshakePayload offer;
+    SecureHandshakePayload response;
+    try {
+      offer = SecureHandshakePayload.fromJson(
+        jsonDecode(packet.payload) as Map<String, dynamic>,
+      );
+      response = await widget.securityRegistry.acceptInitiatorOffer(
+        remoteDeviceId: incoming.deviceId,
+        encodedOffer: packet.payload,
+      );
+    } on Object {
+      return;
+    }
+    if (!mounted) return;
+
     _pairingDialogVisible = true;
     try {
       final accepted = await showDialog<bool>(
@@ -384,7 +415,7 @@ class _HomePageState extends State<HomePage> {
               const Text('请与另一台手机核对验证码'),
               const SizedBox(height: 18),
               Text(
-                packet.payload,
+                offer.verificationCode,
                 style: const TextStyle(
                   fontSize: 30,
                   fontWeight: FontWeight.w700,
@@ -411,7 +442,7 @@ class _HomePageState extends State<HomePage> {
           BlePacket(
             type: BlePacketType.acknowledgement,
             id: packet.id,
-            payload: packet.payload,
+            payload: jsonEncode(response.toJson()),
           ),
         );
       }
@@ -770,12 +801,14 @@ class ChatPage extends StatefulWidget {
     required this.messageStore,
     required this.discoveryService,
     required this.peripheralService,
+    required this.securityRegistry,
     super.key,
   });
 
   final MessageStore messageStore;
   final DiscoveryService discoveryService;
   final UniversalBlePeripheralChat peripheralService;
+  final SessionSecurityRegistry securityRegistry;
 
   @override
   State<ChatPage> createState() => _ChatPageState();
@@ -797,7 +830,12 @@ class _ChatPageState extends State<ChatPage> {
       (packet) => unawaited(
         _handleIncoming(
           packet,
-          acknowledge: widget.discoveryService.sendPacket,
+          decrypt: widget.securityRegistry.decryptFromCentral,
+          acknowledge: (acknowledgement) async {
+            await widget.discoveryService.sendPacket(
+              await widget.securityRegistry.encryptForCentral(acknowledgement),
+            );
+          },
         ),
       ),
     );
@@ -820,10 +858,17 @@ class _ChatPageState extends State<ChatPage> {
         unawaited(
           _handleIncoming(
             packet,
-            acknowledge: (acknowledgement) => widget.peripheralService.send(
-              incoming.deviceId,
-              acknowledgement,
-            ),
+            decrypt: (encrypted) => widget.securityRegistry
+                .decryptFromPeripheral(incoming.deviceId, encrypted),
+            acknowledge: (acknowledgement) async {
+              await widget.peripheralService.send(
+                incoming.deviceId,
+                await widget.securityRegistry.encryptForPeripheral(
+                  incoming.deviceId,
+                  acknowledgement,
+                ),
+              );
+            },
           ),
         );
       } on FormatException {
@@ -986,12 +1031,28 @@ class _ChatPageState extends State<ChatPage> {
     try {
       if (centralConnected) {
         // 先通知对端更新界面，再关闭本机的 GATT 连接。
-        await widget.discoveryService.sendPacket(disconnectPacket);
-        await widget.discoveryService.disconnect();
+        try {
+          await widget.discoveryService.sendPacket(
+            await widget.securityRegistry.encryptForCentral(disconnectPacket),
+          );
+        } finally {
+          await widget.discoveryService.disconnect();
+          widget.securityRegistry.clearCentralSession();
+        }
       }
       if (peripheralPeerId != null) {
-        await widget.peripheralService.send(peripheralPeerId, disconnectPacket);
-        _disconnectedPeripheralPeers.add(peripheralPeerId);
+        try {
+          await widget.peripheralService.send(
+            peripheralPeerId,
+            await widget.securityRegistry.encryptForPeripheral(
+              peripheralPeerId,
+              disconnectPacket,
+            ),
+          );
+        } finally {
+          _disconnectedPeripheralPeers.add(peripheralPeerId);
+          widget.securityRegistry.clearPeripheralSession(peripheralPeerId);
+        }
       }
       if (mounted) {
         setState(() => _peripheralPeerId = null);
@@ -1042,11 +1103,16 @@ class _ChatPageState extends State<ChatPage> {
     try {
       final packet = BlePacket.fromMessage(message);
       if (widget.discoveryService.isConnected) {
-        await widget.discoveryService.sendPacket(packet);
+        await widget.discoveryService.sendPacket(
+          await widget.securityRegistry.encryptForCentral(packet),
+        );
       } else {
         final peerId = _peripheralPeerId;
         if (peerId == null) throw StateError('尚未建立静域通信通道');
-        await widget.peripheralService.send(peerId, packet);
+        await widget.peripheralService.send(
+          peerId,
+          await widget.securityRegistry.encryptForPeripheral(peerId, packet),
+        );
       }
       await Future<void>.delayed(const Duration(seconds: 12));
       _markFailedIfPending(message.id);
@@ -1057,8 +1123,22 @@ class _ChatPageState extends State<ChatPage> {
 
   Future<void> _handleIncoming(
     BlePacket packet, {
+    required Future<BlePacket> Function(BlePacket encrypted) decrypt,
     required Future<void> Function(BlePacket acknowledgement) acknowledge,
   }) async {
+    if (packet.type == BlePacketType.encrypted) {
+      try {
+        final decrypted = await decrypt(packet);
+        await _handleIncoming(
+          decrypted,
+          decrypt: decrypt,
+          acknowledge: acknowledge,
+        );
+      } on Object {
+        // 认证失败或不属于当前会话的密文一律丢弃。
+      }
+      return;
+    }
     if (packet.type == BlePacketType.hello &&
         packet.id == 'disconnect-request') {
       await _handleRemoteDisconnect();
@@ -1099,7 +1179,9 @@ class _ChatPageState extends State<ChatPage> {
     if (peerId != null) _disconnectedPeripheralPeers.add(peerId);
     if (widget.discoveryService.isConnected) {
       await widget.discoveryService.disconnect();
+      widget.securityRegistry.clearCentralSession();
     }
+    if (peerId != null) widget.securityRegistry.clearPeripheralSession(peerId);
     if (!mounted) return;
     setState(() => _peripheralPeerId = null);
     ScaffoldMessenger.of(

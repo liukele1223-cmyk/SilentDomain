@@ -20,6 +20,12 @@ class UniversalBlePeripheralChat {
     _subscriptionListener = UniversalBlePeripheral
         .characteristicSubscriptionStream
         .listen(_flushPendingNotifications);
+    _mtuListener = UniversalBlePeripheral.mtuChangedStream.listen((event) {
+      // ATT 通知值同样受 MTU - 3 限制，保留默认值作为协商前的安全回退。
+      _maxFrameSizes[event.deviceId] = (event.mtu - 3)
+          .clamp(BleFrameCodec.payloadSize, 244)
+          .toInt();
+    });
   }
 
   final StreamController<PeripheralBlePacket> _incomingController =
@@ -28,8 +34,10 @@ class UniversalBlePeripheralChat {
       <String, _PeripheralFrameBuffer>{};
   final Map<String, List<BlePacket>> _pendingNotifications =
       <String, List<BlePacket>>{};
+  final Map<String, int> _maxFrameSizes = <String, int>{};
   StreamSubscription<BlePeripheralCharacteristicSubscriptionChanged>?
   _subscriptionListener;
+  StreamSubscription<BlePeripheralMtuChanged>? _mtuListener;
   bool _initialized = false;
   bool _closed = false;
 
@@ -57,7 +65,10 @@ class UniversalBlePeripheralChat {
           characteristics: [
             BlePeripheralCharacteristic(
               uuid: SilentDomainBleUuid.writeCharacteristic,
-              properties: [CharacteristicProperty.write],
+              properties: [
+                CharacteristicProperty.write,
+                CharacteristicProperty.writeWithoutResponse,
+              ],
               permissions: [PeripheralAttributePermission.writeable],
             ),
             BlePeripheralCharacteristic(
@@ -118,7 +129,11 @@ class UniversalBlePeripheralChat {
   }
 
   Future<void> _sendNow(String deviceId, BlePacket packet) async {
-    for (final frame in BleFrameCodec.split(packet.encode())) {
+    final maxFrameSize = _maxFrameSizes[deviceId] ?? BleFrameCodec.payloadSize;
+    for (final frame in BleFrameCodec.split(
+      packet.encode(),
+      maxFrameSize: maxFrameSize,
+    )) {
       await UniversalBlePeripheral.updateCharacteristicValue(
         characteristicId: SilentDomainBleUuid.notifyCharacteristic,
         deviceId: deviceId,
@@ -180,6 +195,7 @@ class UniversalBlePeripheralChat {
     if (!_initialized) return;
     await UniversalBlePeripheral.stopAdvertising();
     _pendingNotifications.clear();
+    _maxFrameSizes.clear();
     _initialized = false;
   }
 
@@ -188,6 +204,7 @@ class UniversalBlePeripheralChat {
     await stop();
     UniversalBlePeripheral.setWriteRequestHandlers(null);
     await _subscriptionListener?.cancel();
+    await _mtuListener?.cancel();
     _buffers.clear();
     _closed = true;
     await _incomingController.close();
