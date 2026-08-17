@@ -65,11 +65,11 @@ class BleDiscoveryService implements DiscoveryService {
   }
 
   Future<void> _ensurePermissions() async {
-    if (await UniversalBle.hasPermissions(withAndroidFineLocation: true)) {
+    if (await UniversalBle.hasPermissions()) {
       return;
     }
-    await UniversalBle.requestPermissions(withAndroidFineLocation: true);
-    if (!await UniversalBle.hasPermissions(withAndroidFineLocation: true)) {
+    await UniversalBle.requestPermissions();
+    if (!await UniversalBle.hasPermissions()) {
       throw StateError('蓝牙权限未授予');
     }
   }

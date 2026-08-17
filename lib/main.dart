@@ -318,9 +318,20 @@ class _HomePageState extends State<HomePage> {
       if (mounted) setState(() => _broadcasting = !_broadcasting);
     } on Object catch (error) {
       if (mounted) {
-        setState(() => _broadcastError = error.toString());
+        setState(() => _broadcastError = _friendlyBleError(error));
       }
     }
+  }
+
+  String _friendlyBleError(Object error) {
+    final message = error.toString();
+    if (message.contains('permission') || message.contains('Permission')) {
+      return '需要“附近的设备”权限才能开始广播，请在系统提示中允许。';
+    }
+    if (message.contains('not support') || message.contains('不支持')) {
+      return '当前设备不支持蓝牙低功耗广播。';
+    }
+    return '广播启动失败，请确认蓝牙已开启后重试。';
   }
 }
 
