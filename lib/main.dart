@@ -321,7 +321,16 @@ class _DeviceDiscoverySheetState extends State<DeviceDiscoverySheet> {
                     title: Text(device.name),
                     subtitle: Text('信号强度 ${device.rssi ?? '--'} dBm'),
                     trailing: const Icon(Icons.chevron_right_rounded),
-                    onTap: () {},
+                    onTap: () {
+                      Navigator.of(context).push(
+                        MaterialPageRoute<void>(
+                          builder: (_) => ConnectionRequestPage(
+                            device: device,
+                            service: widget.service,
+                          ),
+                        ),
+                      );
+                    },
                   ),
                 FilledButton.icon(
                   onPressed: _isScanning ? null : _startScan,
@@ -357,6 +366,136 @@ class _DeviceDiscoverySheetState extends State<DeviceDiscoverySheet> {
       }
     } finally {
       if (mounted) setState(() => _isScanning = false);
+    }
+  }
+}
+
+class ConnectionRequestPage extends StatefulWidget {
+  const ConnectionRequestPage({
+    required this.device,
+    required this.service,
+    super.key,
+  });
+
+  final NearbyDevice device;
+  final DiscoveryService service;
+
+  @override
+  State<ConnectionRequestPage> createState() => _ConnectionRequestPageState();
+}
+
+class _ConnectionRequestPageState extends State<ConnectionRequestPage> {
+  bool _isConnecting = false;
+  bool _connected = false;
+  String? _error;
+
+  String get _verificationCode {
+    final value = widget.device.id.hashCode.abs() % 900000;
+    return (value + 100000).toString();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('连接确认')),
+      body: SafeArea(
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(24, 24, 24, 32),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              const Icon(
+                Icons.verified_user_outlined,
+                size: 56,
+                color: Color(0xFF477AA9),
+              ),
+              const SizedBox(height: 20),
+              Text(
+                widget.device.name,
+                textAlign: TextAlign.center,
+                style: Theme.of(context).textTheme.headlineSmall?.copyWith(
+                  fontWeight: FontWeight.w700,
+                ),
+              ),
+              const SizedBox(height: 8),
+              const Text('请确认两台设备显示的验证码一致', textAlign: TextAlign.center),
+              const SizedBox(height: 28),
+              Container(
+                padding: const EdgeInsets.symmetric(vertical: 24),
+                decoration: BoxDecoration(
+                  color: Colors.white,
+                  borderRadius: BorderRadius.circular(24),
+                ),
+                child: Text(
+                  _verificationCode,
+                  textAlign: TextAlign.center,
+                  style: const TextStyle(
+                    fontSize: 34,
+                    fontWeight: FontWeight.w700,
+                    letterSpacing: 8,
+                  ),
+                ),
+              ),
+              if (_error != null) ...[
+                const SizedBox(height: 16),
+                Text(
+                  _error!,
+                  textAlign: TextAlign.center,
+                  style: const TextStyle(color: Color(0xFFD94A4A)),
+                ),
+              ],
+              const Spacer(),
+              if (_connected)
+                const Padding(
+                  padding: EdgeInsets.only(bottom: 14),
+                  child: Text(
+                    '连接请求已确认，等待通信通道建立。',
+                    textAlign: TextAlign.center,
+                    style: TextStyle(color: Color(0xFF2E7D5B)),
+                  ),
+                ),
+              FilledButton.icon(
+                onPressed: _isConnecting || _connected
+                    ? null
+                    : _confirmConnection,
+                icon: _isConnecting
+                    ? const SizedBox(
+                        width: 18,
+                        height: 18,
+                        child: CircularProgressIndicator(strokeWidth: 2),
+                      )
+                    : const Icon(Icons.link_rounded),
+                label: Text(
+                  _connected
+                      ? '已连接'
+                      : _isConnecting
+                      ? '正在连接…'
+                      : '确认并连接',
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Future<void> _confirmConnection() async {
+    setState(() {
+      _isConnecting = true;
+      _error = null;
+    });
+    try {
+      await widget.service.connect(widget.device);
+      if (mounted) setState(() => _connected = true);
+    } on Object catch (error) {
+      if (mounted) {
+        setState(
+          () => _error = error.toString().replaceFirst('Bad state: ', ''),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _isConnecting = false);
     }
   }
 }

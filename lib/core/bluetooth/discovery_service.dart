@@ -1,6 +1,6 @@
 import 'dart:async';
 
-import 'package:flutter_blue_plus/flutter_blue_plus.dart';
+import 'package:universal_ble/universal_ble.dart';
 
 class NearbyDevice {
   const NearbyDevice({required this.id, required this.name, this.rssi});
@@ -17,47 +17,57 @@ abstract interface class DiscoveryService {
 
   Future<void> stopScan();
 
+  Future<void> connect(NearbyDevice device);
+
+  Future<void> disconnect();
+
   Future<void> dispose();
 }
 
-/// BLE 发现实现。真实连接和 GATT 通信将在后续子阶段加入。
+/// BLE 发现与连接实现，使用 BSD 3-Clause 许可的 Universal BLE。
 class BleDiscoveryService implements DiscoveryService {
   BleDiscoveryService() {
-    _scanSubscription = FlutterBluePlus.scanResults.listen((results) {
-      final devices = <String, NearbyDevice>{};
-      for (final result in results) {
-        final name = result.device.platformName.trim();
-        if (name.isEmpty) continue;
-        devices[result.device.remoteId.str] = NearbyDevice(
-          id: result.device.remoteId.str,
-          name: name,
-          rssi: result.rssi,
-        );
-      }
-      _devicesController.add(devices.values.toList());
+    _scanSubscription = UniversalBle.scanStream.listen((device) {
+      final name = (device.name ?? device.rawName ?? '').trim();
+      if (name.isEmpty) return;
+      _devicesController.add([
+        NearbyDevice(id: device.deviceId, name: name, rssi: device.rssi),
+      ]);
     });
   }
 
   final _devicesController = StreamController<List<NearbyDevice>>.broadcast();
-  StreamSubscription<List<ScanResult>>? _scanSubscription;
+  StreamSubscription<BleDevice>? _scanSubscription;
+  String? _connectedDeviceId;
 
   @override
   Stream<List<NearbyDevice>> get devices => _devicesController.stream;
 
   @override
   Future<void> startScan() async {
-    if (!await FlutterBluePlus.isSupported) {
-      throw StateError('当前设备不支持蓝牙低功耗扫描');
-    }
-    final state = await FlutterBluePlus.adapterState.first;
-    if (state != BluetoothAdapterState.on) {
+    final state = await UniversalBle.getBluetoothAvailabilityState();
+    if (state != AvailabilityState.poweredOn) {
       throw StateError('请先打开蓝牙');
     }
-    await FlutterBluePlus.startScan(timeout: const Duration(seconds: 12));
+    await UniversalBle.startScan();
+    Timer(const Duration(seconds: 12), stopScan);
   }
 
   @override
-  Future<void> stopScan() => FlutterBluePlus.stopScan();
+  Future<void> stopScan() => UniversalBle.stopScan();
+
+  @override
+  Future<void> connect(NearbyDevice device) async {
+    await UniversalBle.connect(device.id, timeout: const Duration(seconds: 15));
+    _connectedDeviceId = device.id;
+  }
+
+  @override
+  Future<void> disconnect() async {
+    final id = _connectedDeviceId;
+    if (id != null) await UniversalBle.disconnect(id);
+    _connectedDeviceId = null;
+  }
 
   @override
   Future<void> dispose() async {
@@ -84,6 +94,14 @@ class FakeDiscoveryService implements DiscoveryService {
 
   @override
   Future<void> stopScan() async {}
+
+  @override
+  Future<void> connect(NearbyDevice device) async {
+    await Future<void>.delayed(const Duration(milliseconds: 250));
+  }
+
+  @override
+  Future<void> disconnect() async {}
 
   @override
   Future<void> dispose() => _controller.close();

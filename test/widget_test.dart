@@ -41,7 +41,13 @@ void main() {
 
   testWidgets('首页可以打开 BLE 设备发现面板', (WidgetTester tester) async {
     await tester.pumpWidget(
-      SilentDomainApp(discoveryService: FakeDiscoveryService()),
+      SilentDomainApp(
+        discoveryService: FakeDiscoveryService(
+          initialDevices: const [
+            NearbyDevice(id: 'demo-device', name: '演示设备', rssi: -42),
+          ],
+        ),
+      ),
     );
     await tester.pump(const Duration(milliseconds: 1600));
     await tester.pumpAndSettle();
@@ -51,7 +57,14 @@ void main() {
     expect(find.text('发现附近设备'), findsOneWidget);
     await tester.tap(find.text('开始搜索'));
     await tester.pumpAndSettle();
-    expect(find.text('暂未发现设备'), findsOneWidget);
+    expect(find.text('演示设备'), findsOneWidget);
+    await tester.tap(find.text('演示设备'));
+    await tester.pumpAndSettle();
+    expect(find.text('连接确认'), findsOneWidget);
+    expect(find.text('确认并连接'), findsOneWidget);
+    await tester.tap(find.text('确认并连接'));
+    await tester.pumpAndSettle();
+    expect(find.text('已连接'), findsOneWidget);
   });
 
   test('Message copyWith 保留未修改字段', () {
