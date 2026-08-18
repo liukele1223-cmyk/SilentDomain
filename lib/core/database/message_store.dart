@@ -66,6 +66,8 @@ class HiveMessageStore implements MessageStore {
       'content': message.content,
       'timestamp': message.timestamp.toIso8601String(),
       'status': message.status.name,
+      'emojiId': message.emojiId,
+      'emojiName': message.emojiName,
     };
   }
 
@@ -76,6 +78,8 @@ class HiveMessageStore implements MessageStore {
       content: map['content'] as String,
       timestamp: DateTime.parse(map['timestamp'] as String),
       status: MessageStatus.values.byName(map['status'] as String),
+      emojiId: map['emojiId'] as String?,
+      emojiName: map['emojiName'] as String?,
     );
   }
 }

@@ -7,12 +7,14 @@
 
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:image/image.dart' as image;
 import 'package:universal_ble/universal_ble.dart';
 
 import 'package:silent_domain/core/bluetooth/discovery_service.dart';
 import 'package:silent_domain/core/bluetooth/ble_protocol.dart';
 import 'package:silent_domain/core/database/message_store.dart';
 import 'package:silent_domain/core/security/device_identity_service.dart';
+import 'package:silent_domain/features/emoji/emoji_store.dart';
 import 'package:silent_domain/models/message.dart';
 import 'package:silent_domain/main.dart';
 
@@ -38,6 +40,19 @@ void main() {
     await tester.tap(find.byIcon(Icons.error_outline_rounded));
     await tester.pump();
     expect(find.byIcon(Icons.error_outline_rounded), findsOneWidget);
+  });
+
+  testWidgets('聊天输入框可以打开本地表情面板', (WidgetTester tester) async {
+    await tester.pumpWidget(SilentDomainApp());
+    await tester.pump(const Duration(milliseconds: 1600));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('聊天'));
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.byIcon(Icons.emoji_emotions_outlined));
+    await tester.pumpAndSettle();
+    expect(find.text('我的表情'), findsOneWidget);
+    expect(find.text('从相册导入'), findsOneWidget);
   });
 
   testWidgets('首页可以打开 BLE 设备发现面板', (WidgetTester tester) async {
@@ -108,6 +123,23 @@ void main() {
 
     expect(messages, hasLength(1));
     expect(messages.single.content, '本地保存测试');
+  });
+
+  test('表情导入会重新编码、缩放并保存在本地资料库', () async {
+    final source = image.Image(width: 900, height: 300);
+    image.fill(source, color: image.ColorRgb8(20, 40, 60));
+    final sourceBytes = image.encodeJpg(source, quality: 100);
+    final store = MemoryEmojiStore();
+
+    final sticker = await store.importImage(sourceBytes);
+    final asset = await store.loadAsset(sticker.id);
+    final decoded = image.decodeImage(asset!.bytes);
+
+    expect(sticker.path, startsWith('memory://'));
+    expect(decoded, isNotNull);
+    expect(decoded!.width, 512);
+    expect(decoded.height, lessThanOrEqualTo(512));
+    expect(asset.bytes, isNot(equals(sourceBytes)));
   });
 
   test('BLE 数据包可以编码、解码并分片重组', () {

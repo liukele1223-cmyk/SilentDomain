@@ -9,15 +9,21 @@ import 'core/bluetooth/ble_protocol.dart';
 import 'core/bluetooth/universal_ble_peripheral_chat.dart';
 import 'core/database/message_store.dart';
 import 'core/security/device_identity_service.dart';
+import 'features/emoji/emoji_message_content.dart';
+import 'features/emoji/emoji_picker_sheet.dart';
+import 'features/emoji/emoji_sticker.dart';
+import 'features/emoji/emoji_store.dart';
 import 'models/message.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   final messageStore = await HiveMessageStore.create();
+  final emojiStore = await HiveEmojiStore.create();
   final securityRegistry = SessionSecurityRegistry();
   runApp(
     SilentDomainApp(
       messageStore: messageStore,
+      emojiStore: emojiStore,
       discoveryService: BleDiscoveryService(securityRegistry: securityRegistry),
       peripheralService: UniversalBlePeripheralChat(),
       securityRegistry: securityRegistry,
@@ -29,15 +35,18 @@ class SilentDomainApp extends StatelessWidget {
   SilentDomainApp({
     super.key,
     MessageStore? messageStore,
+    EmojiStore? emojiStore,
     DiscoveryService? discoveryService,
     UniversalBlePeripheralChat? peripheralService,
     SessionSecurityRegistry? securityRegistry,
   }) : messageStore = messageStore ?? MemoryMessageStore(),
+       emojiStore = emojiStore ?? MemoryEmojiStore(),
        discoveryService = discoveryService ?? FakeDiscoveryService(),
        peripheralService = peripheralService ?? UniversalBlePeripheralChat(),
        securityRegistry = securityRegistry ?? SessionSecurityRegistry();
 
   final MessageStore messageStore;
+  final EmojiStore emojiStore;
   final DiscoveryService discoveryService;
   final UniversalBlePeripheralChat peripheralService;
   final SessionSecurityRegistry securityRegistry;
@@ -66,6 +75,7 @@ class SilentDomainApp extends StatelessWidget {
       ),
       home: SplashPage(
         messageStore: messageStore,
+        emojiStore: emojiStore,
         discoveryService: discoveryService,
         peripheralService: peripheralService,
         securityRegistry: securityRegistry,
@@ -77,6 +87,7 @@ class SilentDomainApp extends StatelessWidget {
 class SplashPage extends StatefulWidget {
   const SplashPage({
     required this.messageStore,
+    required this.emojiStore,
     required this.discoveryService,
     required this.peripheralService,
     required this.securityRegistry,
@@ -84,6 +95,7 @@ class SplashPage extends StatefulWidget {
   });
 
   final MessageStore messageStore;
+  final EmojiStore emojiStore;
   final DiscoveryService discoveryService;
   final UniversalBlePeripheralChat peripheralService;
   final SessionSecurityRegistry securityRegistry;
@@ -111,6 +123,7 @@ class _SplashPageState extends State<SplashPage>
           MaterialPageRoute<void>(
             builder: (_) => AppShell(
               messageStore: widget.messageStore,
+              emojiStore: widget.emojiStore,
               discoveryService: widget.discoveryService,
               peripheralService: widget.peripheralService,
               securityRegistry: widget.securityRegistry,
@@ -164,6 +177,7 @@ class _SplashPageState extends State<SplashPage>
 class AppShell extends StatefulWidget {
   const AppShell({
     required this.messageStore,
+    required this.emojiStore,
     required this.discoveryService,
     required this.peripheralService,
     required this.securityRegistry,
@@ -171,6 +185,7 @@ class AppShell extends StatefulWidget {
   });
 
   final MessageStore messageStore;
+  final EmojiStore emojiStore;
   final DiscoveryService discoveryService;
   final UniversalBlePeripheralChat peripheralService;
   final SessionSecurityRegistry securityRegistry;
@@ -193,6 +208,7 @@ class _AppShellState extends State<AppShell> {
       ),
       ChatPage(
         messageStore: widget.messageStore,
+        emojiStore: widget.emojiStore,
         discoveryService: widget.discoveryService,
         peripheralService: widget.peripheralService,
         securityRegistry: widget.securityRegistry,
@@ -799,6 +815,7 @@ class _ConnectionRequestPageState extends State<ConnectionRequestPage> {
 class ChatPage extends StatefulWidget {
   const ChatPage({
     required this.messageStore,
+    required this.emojiStore,
     required this.discoveryService,
     required this.peripheralService,
     required this.securityRegistry,
@@ -806,6 +823,7 @@ class ChatPage extends StatefulWidget {
   });
 
   final MessageStore messageStore;
+  final EmojiStore emojiStore;
   final DiscoveryService discoveryService;
   final UniversalBlePeripheralChat peripheralService;
   final SessionSecurityRegistry securityRegistry;
@@ -996,11 +1014,16 @@ class _ChatPageState extends State<ChatPage> {
                     itemCount: _messages.length,
                     itemBuilder: (_, index) => _MessageBubble(
                       message: _messages[index],
+                      emojiStore: widget.emojiStore,
                       onRetry: () => _retryMessage(_messages[index]),
                     ),
                   ),
           ),
-          _Composer(controller: _controller, onSend: _sendMessage),
+          _Composer(
+            controller: _controller,
+            onSend: _sendMessage,
+            onOpenEmoji: _showEmojiPicker,
+          ),
         ],
       ),
     );
@@ -1089,6 +1112,28 @@ class _ChatPageState extends State<ChatPage> {
     unawaited(_transmit(message));
   }
 
+  Future<void> _showEmojiPicker() async {
+    final sticker = await showModalBottomSheet<EmojiSticker>(
+      context: context,
+      isScrollControlled: true,
+      showDragHandle: true,
+      builder: (_) => EmojiPickerSheet(store: widget.emojiStore),
+    );
+    if (sticker == null || !mounted) return;
+    final message = Message(
+      id: DateTime.now().microsecondsSinceEpoch.toString(),
+      sender: 'self',
+      content: '[表情：${sticker.name}]',
+      emojiId: sticker.id,
+      emojiName: sticker.name,
+      timestamp: DateTime.now(),
+      status: MessageStatus.sending,
+    );
+    setState(() => _messages.add(message));
+    unawaited(widget.messageStore.saveMessage(message));
+    unawaited(_transmit(message));
+  }
+
   void _retryMessage(Message message) {
     final index = _messages.indexWhere((item) => item.id == message.id);
     if (index == -1) return;
@@ -1157,6 +1202,8 @@ class _ChatPageState extends State<ChatPage> {
         sender: 'nearby-device',
         content: payload['content'] as String,
         timestamp: DateTime.parse(payload['timestamp'] as String),
+        emojiId: payload['emojiId'] as String?,
+        emojiName: payload['emojiName'] as String?,
       );
       if (mounted && !_messages.any((item) => item.id == message.id)) {
         setState(() => _messages.add(message));
@@ -1383,10 +1430,15 @@ class _EmptyState extends StatelessWidget {
 }
 
 class _Composer extends StatelessWidget {
-  const _Composer({required this.controller, required this.onSend});
+  const _Composer({
+    required this.controller,
+    required this.onSend,
+    required this.onOpenEmoji,
+  });
 
   final TextEditingController controller;
   final VoidCallback onSend;
+  final VoidCallback onOpenEmoji;
 
   @override
   Widget build(BuildContext context) {
@@ -1395,8 +1447,9 @@ class _Composer extends StatelessWidget {
       child: Row(
         children: [
           IconButton(
-            onPressed: () {},
-            icon: const Icon(Icons.add_circle_outline_rounded),
+            onPressed: onOpenEmoji,
+            tooltip: '表情',
+            icon: const Icon(Icons.emoji_emotions_outlined),
           ),
           Expanded(
             child: TextField(
@@ -1424,9 +1477,14 @@ class _Composer extends StatelessWidget {
 }
 
 class _MessageBubble extends StatelessWidget {
-  const _MessageBubble({required this.message, required this.onRetry});
+  const _MessageBubble({
+    required this.message,
+    required this.emojiStore,
+    required this.onRetry,
+  });
 
   final Message message;
+  final EmojiStore emojiStore;
   final VoidCallback onRetry;
 
   @override
@@ -1446,24 +1504,32 @@ class _MessageBubble extends StatelessWidget {
             Row(
               mainAxisSize: MainAxisSize.min,
               children: [
-                Container(
-                  constraints: const BoxConstraints(maxWidth: 290),
-                  padding: const EdgeInsets.symmetric(
-                    horizontal: 16,
-                    vertical: 12,
-                  ),
-                  decoration: BoxDecoration(
-                    color: mine ? const Color(0xFF17324F) : Colors.white,
-                    borderRadius: BorderRadius.circular(18),
-                  ),
-                  child: Text(
-                    message.content,
-                    style: TextStyle(
-                      color: mine ? Colors.white : const Color(0xFF24354A),
-                      height: 1.35,
+                if (message.emojiId == null)
+                  Container(
+                    constraints: const BoxConstraints(maxWidth: 290),
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 16,
+                      vertical: 12,
                     ),
+                    decoration: BoxDecoration(
+                      color: mine ? const Color(0xFF17324F) : Colors.white,
+                      borderRadius: BorderRadius.circular(18),
+                    ),
+                    child: Text(
+                      message.content,
+                      style: TextStyle(
+                        color: mine ? Colors.white : const Color(0xFF24354A),
+                        height: 1.35,
+                      ),
+                    ),
+                  )
+                else
+                  EmojiMessageContent(
+                    emojiId: message.emojiId!,
+                    emojiName: message.emojiName ?? '表情',
+                    emojiStore: emojiStore,
+                    color: mine ? Colors.white : const Color(0xFF24354A),
                   ),
-                ),
                 if (mine && message.status == MessageStatus.failed)
                   IconButton(
                     onPressed: onRetry,

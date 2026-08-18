@@ -57,6 +57,8 @@ class BlePacket {
         'content': message.content,
         'timestamp': message.timestamp.toIso8601String(),
         'status': message.status.name,
+        'emojiId': message.emojiId,
+        'emojiName': message.emojiName,
       }),
     );
   }
