@@ -15,6 +15,7 @@ import 'package:silent_domain/core/bluetooth/ble_protocol.dart';
 import 'package:silent_domain/core/database/message_store.dart';
 import 'package:silent_domain/core/security/device_identity_service.dart';
 import 'package:silent_domain/features/emoji/emoji_store.dart';
+import 'package:silent_domain/features/theme/theme_settings.dart';
 import 'package:silent_domain/models/message.dart';
 import 'package:silent_domain/main.dart';
 
@@ -53,6 +54,21 @@ void main() {
     await tester.pumpAndSettle();
     expect(find.text('我的表情'), findsOneWidget);
     expect(find.text('从相册导入'), findsOneWidget);
+  });
+
+  testWidgets('设置页可以切换到森林绿主题', (WidgetTester tester) async {
+    final themeController = ThemeController(null);
+    await tester.pumpWidget(SilentDomainApp(themeController: themeController));
+    await tester.pump(const Duration(milliseconds: 1600));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('设置'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('主题'));
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.text('森林绿').first);
+    await tester.pump();
+    expect(themeController.settings.mode, AppThemeMode.forestGreen);
   });
 
   testWidgets('首页可以打开 BLE 设备发现面板', (WidgetTester tester) async {
@@ -140,6 +156,19 @@ void main() {
     expect(decoded!.width, 512);
     expect(decoded.height, lessThanOrEqualTo(512));
     expect(asset.bytes, isNot(equals(sourceBytes)));
+  });
+
+  test('主题控制器支持切换自定义 RGB 颜色', () async {
+    final controller = ThemeController(null);
+
+    controller.previewCustomColor(const Color(0xFF123456));
+
+    expect(controller.settings.mode, AppThemeMode.custom);
+    expect(controller.settings.customColor, const Color(0xFF123456));
+    expect(controller.isPreviewing, isTrue);
+
+    await controller.finishCustomPreview();
+    expect(controller.isPreviewing, isFalse);
   });
 
   test('BLE 数据包可以编码、解码并分片重组', () {

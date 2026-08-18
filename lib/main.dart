@@ -13,17 +13,22 @@ import 'features/emoji/emoji_message_content.dart';
 import 'features/emoji/emoji_picker_sheet.dart';
 import 'features/emoji/emoji_sticker.dart';
 import 'features/emoji/emoji_store.dart';
+import 'features/theme/theme_settings.dart';
+import 'features/theme/theme_picker_sheet.dart';
 import 'models/message.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   final messageStore = await HiveMessageStore.create();
   final emojiStore = await HiveEmojiStore.create();
+  final themeController = ThemeController(await ThemeStore.create());
+  await themeController.load();
   final securityRegistry = SessionSecurityRegistry();
   runApp(
     SilentDomainApp(
       messageStore: messageStore,
       emojiStore: emojiStore,
+      themeController: themeController,
       discoveryService: BleDiscoveryService(securityRegistry: securityRegistry),
       peripheralService: UniversalBlePeripheralChat(),
       securityRegistry: securityRegistry,
@@ -36,49 +41,43 @@ class SilentDomainApp extends StatelessWidget {
     super.key,
     MessageStore? messageStore,
     EmojiStore? emojiStore,
+    ThemeController? themeController,
     DiscoveryService? discoveryService,
     UniversalBlePeripheralChat? peripheralService,
     SessionSecurityRegistry? securityRegistry,
   }) : messageStore = messageStore ?? MemoryMessageStore(),
        emojiStore = emojiStore ?? MemoryEmojiStore(),
+       themeController = themeController ?? ThemeController(null),
        discoveryService = discoveryService ?? FakeDiscoveryService(),
        peripheralService = peripheralService ?? UniversalBlePeripheralChat(),
        securityRegistry = securityRegistry ?? SessionSecurityRegistry();
 
   final MessageStore messageStore;
   final EmojiStore emojiStore;
+  final ThemeController themeController;
   final DiscoveryService discoveryService;
   final UniversalBlePeripheralChat peripheralService;
   final SessionSecurityRegistry securityRegistry;
 
   @override
   Widget build(BuildContext context) {
-    return MaterialApp(
-      title: '静域',
-      debugShowCheckedModeBanner: false,
-      theme: ThemeData(
-        useMaterial3: true,
-        colorScheme: ColorScheme.fromSeed(seedColor: const Color(0xFF78A9D8)),
-        scaffoldBackgroundColor: const Color(0xFFF7F9FC),
-        appBarTheme: const AppBarTheme(
-          backgroundColor: Color(0xFFF7F9FC),
-          surfaceTintColor: Colors.transparent,
+    return AnimatedBuilder(
+      animation: themeController,
+      builder: (context, _) => MaterialApp(
+        title: '静域',
+        debugShowCheckedModeBanner: false,
+        theme: SilentDomainThemes.build(themeController.settings),
+        themeAnimationDuration: themeController.isPreviewing
+            ? Duration.zero
+            : const Duration(milliseconds: 260),
+        home: SplashPage(
+          messageStore: messageStore,
+          emojiStore: emojiStore,
+          themeController: themeController,
+          discoveryService: discoveryService,
+          peripheralService: peripheralService,
+          securityRegistry: securityRegistry,
         ),
-        inputDecorationTheme: const InputDecorationTheme(
-          filled: true,
-          fillColor: Colors.white,
-          border: OutlineInputBorder(
-            borderRadius: BorderRadius.all(Radius.circular(18)),
-            borderSide: BorderSide.none,
-          ),
-        ),
-      ),
-      home: SplashPage(
-        messageStore: messageStore,
-        emojiStore: emojiStore,
-        discoveryService: discoveryService,
-        peripheralService: peripheralService,
-        securityRegistry: securityRegistry,
       ),
     );
   }
@@ -88,6 +87,7 @@ class SplashPage extends StatefulWidget {
   const SplashPage({
     required this.messageStore,
     required this.emojiStore,
+    required this.themeController,
     required this.discoveryService,
     required this.peripheralService,
     required this.securityRegistry,
@@ -96,6 +96,7 @@ class SplashPage extends StatefulWidget {
 
   final MessageStore messageStore;
   final EmojiStore emojiStore;
+  final ThemeController themeController;
   final DiscoveryService discoveryService;
   final UniversalBlePeripheralChat peripheralService;
   final SessionSecurityRegistry securityRegistry;
@@ -124,6 +125,7 @@ class _SplashPageState extends State<SplashPage>
             builder: (_) => AppShell(
               messageStore: widget.messageStore,
               emojiStore: widget.emojiStore,
+              themeController: widget.themeController,
               discoveryService: widget.discoveryService,
               peripheralService: widget.peripheralService,
               securityRegistry: widget.securityRegistry,
@@ -178,6 +180,7 @@ class AppShell extends StatefulWidget {
   const AppShell({
     required this.messageStore,
     required this.emojiStore,
+    required this.themeController,
     required this.discoveryService,
     required this.peripheralService,
     required this.securityRegistry,
@@ -186,6 +189,7 @@ class AppShell extends StatefulWidget {
 
   final MessageStore messageStore;
   final EmojiStore emojiStore;
+  final ThemeController themeController;
   final DiscoveryService discoveryService;
   final UniversalBlePeripheralChat peripheralService;
   final SessionSecurityRegistry securityRegistry;
@@ -213,7 +217,7 @@ class _AppShellState extends State<AppShell> {
         peripheralService: widget.peripheralService,
         securityRegistry: widget.securityRegistry,
       ),
-      const SettingsPage(),
+      SettingsPage(themeController: widget.themeController),
     ];
     return Scaffold(
       body: IndexedStack(index: _index, children: pages),
@@ -1263,60 +1267,76 @@ class _ChatPageState extends State<ChatPage> {
 enum _ChatMenuAction { disconnect }
 
 class SettingsPage extends StatelessWidget {
-  const SettingsPage({super.key});
+  const SettingsPage({required this.themeController, super.key});
+
+  final ThemeController themeController;
 
   @override
   Widget build(BuildContext context) {
-    return SafeArea(
-      child: ListView(
-        padding: const EdgeInsets.fromLTRB(24, 28, 24, 28),
-        children: [
-          Text(
-            '设置',
-            style: Theme.of(
-              context,
-            ).textTheme.headlineSmall?.copyWith(fontWeight: FontWeight.w700),
-          ),
-          const SizedBox(height: 24),
-          const _SettingsSection(
-            title: '外观',
-            children: [
-              _SettingsTile(
-                icon: Icons.palette_outlined,
-                title: '主题',
-                subtitle: '深空蓝',
-              ),
-            ],
-          ),
-          const SizedBox(height: 20),
-          const _SettingsSection(
-            title: '隐私与安全',
-            children: [
-              _SettingsTile(
-                icon: Icons.lock_outline_rounded,
-                title: '本地安全',
-                subtitle: '数据只保存在本机',
-              ),
-              _SettingsTile(
-                icon: Icons.key_outlined,
-                title: '设备身份',
-                subtitle: '尚未建立连接',
-              ),
-            ],
-          ),
-          const SizedBox(height: 20),
-          const _SettingsSection(
-            title: '关于',
-            children: [
-              _SettingsTile(
-                icon: Icons.info_outline_rounded,
-                title: '关于静域',
-                subtitle: 'Silent Domain · 0.1.0',
-              ),
-            ],
-          ),
-        ],
+    return AnimatedBuilder(
+      animation: themeController,
+      builder: (context, _) => SafeArea(
+        child: ListView(
+          padding: const EdgeInsets.fromLTRB(24, 28, 24, 28),
+          children: [
+            Text(
+              '设置',
+              style: Theme.of(
+                context,
+              ).textTheme.headlineSmall?.copyWith(fontWeight: FontWeight.w700),
+            ),
+            const SizedBox(height: 24),
+            _SettingsSection(
+              title: '外观',
+              children: [
+                _SettingsTile(
+                  icon: Icons.palette_outlined,
+                  title: '主题',
+                  subtitle: SilentDomainThemes.labelFor(
+                    themeController.settings.mode,
+                  ),
+                  onTap: () => _showThemePicker(context),
+                ),
+              ],
+            ),
+            const SizedBox(height: 20),
+            const _SettingsSection(
+              title: '隐私与安全',
+              children: [
+                _SettingsTile(
+                  icon: Icons.lock_outline_rounded,
+                  title: '本地安全',
+                  subtitle: '数据只保存在本机',
+                ),
+                _SettingsTile(
+                  icon: Icons.key_outlined,
+                  title: '设备身份',
+                  subtitle: '尚未建立连接',
+                ),
+              ],
+            ),
+            const SizedBox(height: 20),
+            const _SettingsSection(
+              title: '关于',
+              children: [
+                _SettingsTile(
+                  icon: Icons.info_outline_rounded,
+                  title: '关于静域',
+                  subtitle: 'Silent Domain · 0.1.0',
+                ),
+              ],
+            ),
+          ],
+        ),
       ),
+    );
+  }
+
+  void _showThemePicker(BuildContext context) {
+    showModalBottomSheet<void>(
+      context: context,
+      showDragHandle: true,
+      builder: (_) => ThemePickerSheet(controller: themeController),
     );
   }
 }
@@ -1330,36 +1350,38 @@ class _ConnectionCard extends StatelessWidget {
   Widget build(BuildContext context) {
     return Card(
       elevation: 0,
-      color: const Color(0xFF17324F),
+      color: Theme.of(context).colorScheme.primary,
       child: Padding(
         padding: const EdgeInsets.all(22),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            const Icon(
+            Icon(
               Icons.wifi_tethering_rounded,
-              color: Color(0xFFBBD9F5),
+              color: Theme.of(context).colorScheme.onPrimary,
               size: 30,
             ),
             const SizedBox(height: 18),
             Text(
               '连接附近设备',
               style: Theme.of(context).textTheme.titleLarge?.copyWith(
-                color: Colors.white,
+                color: Theme.of(context).colorScheme.onPrimary,
                 fontWeight: FontWeight.w700,
               ),
             ),
             const SizedBox(height: 6),
-            const Text(
+            Text(
               '在没有网络的地方，也能保持联系。',
-              style: TextStyle(color: Color(0xFFBBD0E5)),
+              style: TextStyle(color: Theme.of(context).colorScheme.onPrimary),
             ),
             const SizedBox(height: 20),
             FilledButton(
               onPressed: onPressed,
               style: FilledButton.styleFrom(
-                backgroundColor: const Color(0xFFBBD9F5),
-                foregroundColor: const Color(0xFF17324F),
+                backgroundColor: Theme.of(context).colorScheme.primaryContainer,
+                foregroundColor: Theme.of(
+                  context,
+                ).colorScheme.onPrimaryContainer,
               ),
               child: const Text('发现设备'),
             ),
@@ -1381,12 +1403,12 @@ class _DomainMark extends StatelessWidget {
       width: size,
       height: size,
       decoration: BoxDecoration(
-        color: const Color(0xFF17324F),
+        color: Theme.of(context).colorScheme.primary,
         borderRadius: BorderRadius.circular(size * .28),
       ),
       child: Icon(
         Icons.all_inclusive_rounded,
-        color: const Color(0xFFBBD9F5),
+        color: Theme.of(context).colorScheme.onPrimary,
         size: size * .55,
       ),
     );
@@ -1598,20 +1620,22 @@ class _SettingsTile extends StatelessWidget {
     required this.icon,
     required this.title,
     required this.subtitle,
+    this.onTap,
   });
 
   final IconData icon;
   final String title;
   final String subtitle;
+  final VoidCallback? onTap;
 
   @override
   Widget build(BuildContext context) {
     return ListTile(
-      leading: Icon(icon, color: const Color(0xFF477AA9)),
+      leading: Icon(icon, color: Theme.of(context).colorScheme.primary),
       title: Text(title),
       subtitle: Text(subtitle),
       trailing: const Icon(Icons.chevron_right_rounded),
-      onTap: () {},
+      onTap: onTap,
     );
   }
 }
