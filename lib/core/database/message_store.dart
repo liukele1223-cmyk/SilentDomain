@@ -1,5 +1,6 @@
 import 'dart:convert';
 import 'dart:math';
+import 'dart:typed_data';
 
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:hive_flutter/hive_flutter.dart';
@@ -68,6 +69,8 @@ class HiveMessageStore implements MessageStore {
       'status': message.status.name,
       'emojiId': message.emojiId,
       'emojiName': message.emojiName,
+      'emojiSnapshot': message.emojiSnapshot,
+      'transferProgress': message.transferProgress,
     };
   }
 
@@ -80,7 +83,19 @@ class HiveMessageStore implements MessageStore {
       status: MessageStatus.values.byName(map['status'] as String),
       emojiId: map['emojiId'] as String?,
       emojiName: map['emojiName'] as String?,
+      emojiSnapshot: _readSnapshot(map['emojiSnapshot']),
+      transferProgress: (map['transferProgress'] as num?)?.toDouble(),
     );
+  }
+
+  static Uint8List? _readSnapshot(Object? value) {
+    if (value is Uint8List) return value;
+    if (value is List) {
+      return Uint8List.fromList(
+        value.whereType<num>().map((item) => item.toInt()).toList(),
+      );
+    }
+    return null;
   }
 }
 

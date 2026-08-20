@@ -35,11 +35,19 @@ class UniversalBlePeripheralChat {
   final Map<String, List<BlePacket>> _pendingNotifications =
       <String, List<BlePacket>>{};
   final Map<String, int> _maxFrameSizes = <String, int>{};
+  final Map<String, Future<void>> _notificationQueues =
+      <String, Future<void>>{};
   StreamSubscription<BlePeripheralCharacteristicSubscriptionChanged>?
   _subscriptionListener;
   StreamSubscription<BlePeripheralMtuChanged>? _mtuListener;
   bool _initialized = false;
   bool _closed = false;
+
+  static const _maximumNotificationAttempts = 5;
+  static const _notificationTimeout = Duration(seconds: 2);
+  // Android 的通知 API 只表示数据已交给本机蓝牙栈，并不代表对端已经取走。
+  // 轻微间隔能避免双向图片传输时将其内部缓冲一次性灌满。
+  static const _notificationFrameInterval = Duration(milliseconds: 8);
 
   Stream<PeripheralBlePacket> get incomingPackets => _incomingController.stream;
 
@@ -114,18 +122,33 @@ class UniversalBlePeripheralChat {
     }
   }
 
-  Future<void> send(String deviceId, BlePacket packet) async {
+  Future<void> send(String deviceId, BlePacket packet) {
     _ensureReady();
-    final subscribedClients = await UniversalBlePeripheral.getSubscribedClients(
-      SilentDomainBleUuid.notifyCharacteristic,
-    );
-    if (!subscribedClients.contains(deviceId)) {
-      _pendingNotifications
-          .putIfAbsent(deviceId, () => <BlePacket>[])
-          .add(packet);
-      return;
-    }
-    await _sendNow(deviceId, packet);
+    return _enqueueNotification(deviceId, () async {
+      final subscribedClients =
+          await UniversalBlePeripheral.getSubscribedClients(
+            SilentDomainBleUuid.notifyCharacteristic,
+          ).timeout(_notificationTimeout);
+      if (!subscribedClients.contains(deviceId)) {
+        _pendingNotifications
+            .putIfAbsent(deviceId, () => <BlePacket>[])
+            .add(packet);
+        return;
+      }
+      await _sendNow(deviceId, packet);
+    });
+  }
+
+  /// 图片分片、分片确认和最终回执可能同时产生。GATT 通知中的应用帧若
+  /// 交错，中心端无法区分两条逻辑消息；每个客户端必须使用同一发送队列。
+  Future<void> _enqueueNotification(
+    String deviceId,
+    Future<void> Function() operation,
+  ) {
+    final previous = _notificationQueues[deviceId] ?? Future<void>.value();
+    final task = previous.then((_) => operation());
+    _notificationQueues[deviceId] = task.then<void>((_) {}, onError: (_, _) {});
+    return task;
   }
 
   Future<void> _sendNow(String deviceId, BlePacket packet) async {
@@ -134,11 +157,25 @@ class UniversalBlePeripheralChat {
       packet.encode(),
       maxFrameSize: maxFrameSize,
     )) {
-      await UniversalBlePeripheral.updateCharacteristicValue(
-        characteristicId: SilentDomainBleUuid.notifyCharacteristic,
-        deviceId: deviceId,
-        value: frame,
-      );
+      await _notifyFrameWithRetry(deviceId, frame);
+      await Future<void>.delayed(_notificationFrameInterval);
+    }
+  }
+
+  /// 通知队列在高频图片传输时同样可能暂时繁忙；只重试当前帧，保持顺序。
+  Future<void> _notifyFrameWithRetry(String deviceId, Uint8List frame) async {
+    for (var attempt = 0; attempt < _maximumNotificationAttempts; attempt++) {
+      try {
+        await UniversalBlePeripheral.updateCharacteristicValue(
+          characteristicId: SilentDomainBleUuid.notifyCharacteristic,
+          deviceId: deviceId,
+          value: frame,
+        ).timeout(_notificationTimeout);
+        return;
+      } on Object {
+        if (attempt == _maximumNotificationAttempts - 1) rethrow;
+        await Future<void>.delayed(Duration(milliseconds: 60 * (attempt + 1)));
+      }
     }
   }
 
@@ -155,7 +192,12 @@ class UniversalBlePeripheralChat {
     final packets = _pendingNotifications.remove(event.deviceId);
     if (packets == null) return;
     for (final packet in packets) {
-      unawaited(_sendNow(event.deviceId, packet));
+      unawaited(
+        _enqueueNotification(
+          event.deviceId,
+          () => _sendNow(event.deviceId, packet),
+        ),
+      );
     }
   }
 
@@ -196,6 +238,8 @@ class UniversalBlePeripheralChat {
     await UniversalBlePeripheral.stopAdvertising();
     _pendingNotifications.clear();
     _maxFrameSizes.clear();
+    _notificationQueues.clear();
+    _buffers.clear();
     _initialized = false;
   }
 
@@ -222,11 +266,13 @@ class UniversalBlePeripheralChat {
 
 class _PeripheralFrameBuffer {
   int? total;
+  int? transferId;
   final Map<int, List<int>> frames = <int, List<int>>{};
 
   List<int>? add(Frame frame) {
-    if (total != frame.total) {
+    if (transferId != frame.transferId || total != frame.total) {
       total = frame.total;
+      transferId = frame.transferId;
       frames.clear();
     }
     frames[frame.index] = frame.payload;

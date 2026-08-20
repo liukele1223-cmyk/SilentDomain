@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:math';
+import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
 
@@ -10,9 +11,11 @@ import 'core/bluetooth/universal_ble_peripheral_chat.dart';
 import 'core/database/message_store.dart';
 import 'core/security/device_identity_service.dart';
 import 'features/emoji/emoji_message_content.dart';
+import 'features/emoji/emoji_management_page.dart';
 import 'features/emoji/emoji_picker_sheet.dart';
 import 'features/emoji/emoji_sticker.dart';
 import 'features/emoji/emoji_store.dart';
+import 'features/emoji/emoji_transfer.dart';
 import 'features/theme/theme_settings.dart';
 import 'features/theme/theme_picker_sheet.dart';
 import 'models/message.dart';
@@ -217,7 +220,10 @@ class _AppShellState extends State<AppShell> {
         peripheralService: widget.peripheralService,
         securityRegistry: widget.securityRegistry,
       ),
-      SettingsPage(themeController: widget.themeController),
+      SettingsPage(
+        themeController: widget.themeController,
+        emojiStore: widget.emojiStore,
+      ),
     ];
     return Scaffold(
       body: IndexedStack(index: _index, children: pages),
@@ -368,6 +374,7 @@ class _HomePageState extends State<HomePage> {
     showModalBottomSheet<void>(
       context: context,
       showDragHandle: true,
+      isScrollControlled: true,
       builder: (sheetContext) => DeviceDiscoverySheet(
         service: widget.discoveryService,
         onOpenChat: () {
@@ -565,16 +572,18 @@ class _DeviceDiscoverySheetState extends State<DeviceDiscoverySheet> {
   @override
   Widget build(BuildContext context) {
     return SafeArea(
-      child: Padding(
-        padding: const EdgeInsets.fromLTRB(24, 8, 24, 28),
+      child: ConstrainedBox(
+        constraints: BoxConstraints(
+          maxHeight: MediaQuery.sizeOf(context).height * .78,
+        ),
         child: StreamBuilder<List<NearbyDevice>>(
           stream: widget.service.devices,
           initialData: const [],
           builder: (context, snapshot) {
             final devices = snapshot.data ?? const <NearbyDevice>[];
-            return Column(
-              mainAxisSize: MainAxisSize.min,
-              crossAxisAlignment: CrossAxisAlignment.start,
+            return ListView(
+              shrinkWrap: true,
+              padding: const EdgeInsets.fromLTRB(24, 8, 24, 28),
               children: [
                 Text('发现附近设备', style: Theme.of(context).textTheme.titleLarge),
                 const SizedBox(height: 8),
@@ -625,6 +634,7 @@ class _DeviceDiscoverySheetState extends State<DeviceDiscoverySheet> {
                       }
                     },
                   ),
+                const SizedBox(height: 8),
                 FilledButton.icon(
                   onPressed: _isScanning ? null : _startScan,
                   icon: _isScanning
@@ -838,65 +848,33 @@ class ChatPage extends StatefulWidget {
 
 class _ChatPageState extends State<ChatPage> {
   final _controller = TextEditingController();
+  final _scrollController = ScrollController();
   final _messages = <Message>[];
   bool _isLoading = true;
+  bool _isNearBottom = true;
+  bool _hasUnreadMessages = false;
   StreamSubscription<BlePacket>? _centralPackets;
   StreamSubscription<PeripheralBlePacket>? _peripheralPackets;
   String? _peripheralPeerId;
   final Set<String> _disconnectedPeripheralPeers = <String>{};
+  final Map<String, _IncomingEmojiTransfer> _incomingEmojiTransfers =
+      <String, _IncomingEmojiTransfer>{};
+  final Map<String, _OutgoingEmojiTransfer> _outgoingEmojiTransfers =
+      <String, _OutgoingEmojiTransfer>{};
+  Future<void> _centralIncomingQueue = Future<void>.value();
+  final Map<String, Future<void>> _peripheralIncomingQueues =
+      <String, Future<void>>{};
 
   @override
   void initState() {
     super.initState();
+    _scrollController.addListener(_handleChatScroll);
     _centralPackets = widget.discoveryService.incomingPackets.listen(
-      (packet) => unawaited(
-        _handleIncoming(
-          packet,
-          decrypt: widget.securityRegistry.decryptFromCentral,
-          acknowledge: (acknowledgement) async {
-            await widget.discoveryService.sendPacket(
-              await widget.securityRegistry.encryptForCentral(acknowledgement),
-            );
-          },
-        ),
-      ),
+      _enqueueCentralPacket,
     );
-    _peripheralPackets = widget.peripheralService.incomingPackets.listen((
-      incoming,
-    ) {
-      try {
-        final packet = BlePacket.decode(incoming.bytes);
-        final isPairingRequest =
-            packet.type == BlePacketType.hello &&
-            packet.id == 'pairing-request';
-        if (_disconnectedPeripheralPeers.contains(incoming.deviceId) &&
-            !isPairingRequest) {
-          return;
-        }
-        if (isPairingRequest) {
-          _disconnectedPeripheralPeers.remove(incoming.deviceId);
-        }
-        _setPeripheralPeer(incoming.deviceId);
-        unawaited(
-          _handleIncoming(
-            packet,
-            decrypt: (encrypted) => widget.securityRegistry
-                .decryptFromPeripheral(incoming.deviceId, encrypted),
-            acknowledge: (acknowledgement) async {
-              await widget.peripheralService.send(
-                incoming.deviceId,
-                await widget.securityRegistry.encryptForPeripheral(
-                  incoming.deviceId,
-                  acknowledgement,
-                ),
-              );
-            },
-          ),
-        );
-      } on FormatException {
-        // 忽略不属于静域协议的损坏包。
-      }
-    });
+    _peripheralPackets = widget.peripheralService.incomingPackets.listen(
+      _enqueuePeripheralPacket,
+    );
     _loadMessages();
   }
 
@@ -935,6 +913,7 @@ class _ChatPageState extends State<ChatPage> {
         ..addAll(messages);
       _isLoading = false;
     });
+    _scheduleScrollToBottom(jump: true);
   }
 
   @override
@@ -942,6 +921,9 @@ class _ChatPageState extends State<ChatPage> {
     _centralPackets?.cancel();
     _peripheralPackets?.cancel();
     _controller.dispose();
+    _scrollController
+      ..removeListener(_handleChatScroll)
+      ..dispose();
     super.dispose();
   }
 
@@ -1013,14 +995,30 @@ class _ChatPageState extends State<ChatPage> {
           Expanded(
             child: _isLoading
                 ? const Center(child: CircularProgressIndicator())
-                : ListView.builder(
-                    padding: const EdgeInsets.fromLTRB(18, 22, 18, 18),
-                    itemCount: _messages.length,
-                    itemBuilder: (_, index) => _MessageBubble(
-                      message: _messages[index],
-                      emojiStore: widget.emojiStore,
-                      onRetry: () => _retryMessage(_messages[index]),
-                    ),
+                : Stack(
+                    children: [
+                      ListView.builder(
+                        key: const ValueKey('chat-message-list'),
+                        controller: _scrollController,
+                        padding: const EdgeInsets.fromLTRB(18, 22, 18, 18),
+                        itemCount: _messages.length,
+                        itemBuilder: (_, index) => _MessageBubble(
+                          message: _messages[index],
+                          emojiStore: widget.emojiStore,
+                          onRetry: () => _retryMessage(_messages[index]),
+                        ),
+                      ),
+                      if (_hasUnreadMessages)
+                        Positioned(
+                          right: 18,
+                          bottom: 14,
+                          child: FilledButton.icon(
+                            onPressed: _scrollToBottom,
+                            icon: const Icon(Icons.arrow_downward_rounded),
+                            label: const Text('有新消息'),
+                          ),
+                        ),
+                    ],
                   ),
           ),
           _Composer(
@@ -1035,6 +1033,135 @@ class _ChatPageState extends State<ChatPage> {
 
   bool get _isConnected =>
       widget.discoveryService.isConnected || _peripheralPeerId != null;
+
+  bool get _isAtBottom {
+    if (!_scrollController.hasClients) return true;
+    final position = _scrollController.position;
+    return position.maxScrollExtent - position.pixels <= 88;
+  }
+
+  void _handleChatScroll() {
+    final nextIsNearBottom = _isAtBottom;
+    if (nextIsNearBottom == _isNearBottom &&
+        (!nextIsNearBottom || !_hasUnreadMessages)) {
+      return;
+    }
+    setState(() {
+      _isNearBottom = nextIsNearBottom;
+      if (nextIsNearBottom) _hasUnreadMessages = false;
+    });
+  }
+
+  void _scheduleScrollToBottom({bool jump = false}) {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted || !_scrollController.hasClients) return;
+      if (jump) {
+        _scrollController.jumpTo(_scrollController.position.maxScrollExtent);
+      } else {
+        unawaited(_scrollToBottom());
+      }
+    });
+  }
+
+  Future<void> _scrollToBottom() async {
+    if (!_scrollController.hasClients) return;
+    if (_hasUnreadMessages && mounted) {
+      setState(() => _hasUnreadMessages = false);
+    }
+    // 新消息、进度和提示按钮都可能在本帧改变列表高度。先等待布局
+    // 完成，再读取 maxScrollExtent，避免滚动停在“接近底部”的旧位置。
+    await WidgetsBinding.instance.endOfFrame;
+    if (!mounted || !_scrollController.hasClients) return;
+    await _scrollController.animateTo(
+      _scrollController.position.maxScrollExtent,
+      duration: const Duration(milliseconds: 220),
+      curve: Curves.easeOut,
+    );
+    // 在图片解码、状态标签刷新等异步布局期间，最大滚动距离仍可能继续
+    // 增长。补一次短跟随，确保用户点击提示后确实到达最新一条消息。
+    if (!mounted || !_scrollController.hasClients) return;
+    final remainingDistance =
+        _scrollController.position.maxScrollExtent -
+        _scrollController.position.pixels;
+    if (remainingDistance > 1) {
+      await _scrollController.animateTo(
+        _scrollController.position.maxScrollExtent,
+        duration: const Duration(milliseconds: 120),
+        curve: Curves.easeOut,
+      );
+    }
+  }
+
+  void _revealLatestMessage({required bool shouldFollow}) {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      if (shouldFollow) {
+        unawaited(_scrollToBottom());
+      } else if (!_hasUnreadMessages) {
+        setState(() => _hasUnreadMessages = true);
+      }
+    });
+  }
+
+  /// AES 解密是异步的。若并行处理，图片完成包可能比前面的分片更早完成
+  /// 解密，导致 100% 时误判图片不完整；同一 BLE 连接必须保持入站顺序。
+  void _enqueueCentralPacket(BlePacket packet) {
+    final task = _centralIncomingQueue.then(
+      (_) => _handleIncoming(
+        packet,
+        decrypt: widget.securityRegistry.decryptFromCentral,
+        acknowledge: (acknowledgement) async {
+          await widget.discoveryService.sendPacket(
+            await widget.securityRegistry.encryptForCentral(acknowledgement),
+          );
+        },
+      ),
+    );
+    _centralIncomingQueue = task.then<void>((_) {}, onError: (_, _) {});
+  }
+
+  void _enqueuePeripheralPacket(PeripheralBlePacket incoming) {
+    final previous =
+        _peripheralIncomingQueues[incoming.deviceId] ?? Future<void>.value();
+    final task = previous.then((_) async {
+      try {
+        final packet = BlePacket.decode(incoming.bytes);
+        final isPairingRequest =
+            packet.type == BlePacketType.hello &&
+            packet.id == 'pairing-request';
+        if (_disconnectedPeripheralPeers.contains(incoming.deviceId) &&
+            !isPairingRequest) {
+          return;
+        }
+        if (isPairingRequest) {
+          _disconnectedPeripheralPeers.remove(incoming.deviceId);
+        }
+        _setPeripheralPeer(incoming.deviceId);
+        await _handleIncoming(
+          packet,
+          decrypt: (encrypted) => widget.securityRegistry.decryptFromPeripheral(
+            incoming.deviceId,
+            encrypted,
+          ),
+          acknowledge: (acknowledgement) async {
+            await widget.peripheralService.send(
+              incoming.deviceId,
+              await widget.securityRegistry.encryptForPeripheral(
+                incoming.deviceId,
+                acknowledgement,
+              ),
+            );
+          },
+        );
+      } on FormatException {
+        // 忽略不属于静域协议的损坏包。
+      }
+    });
+    _peripheralIncomingQueues[incoming.deviceId] = task.then<void>(
+      (_) {},
+      onError: (_, _) {},
+    );
+  }
 
   void _setPeripheralPeer(String deviceId) {
     if (_peripheralPeerId == deviceId) return;
@@ -1111,6 +1238,7 @@ class _ChatPageState extends State<ChatPage> {
       _messages.add(message);
       _controller.clear();
     });
+    _revealLatestMessage(shouldFollow: true);
     unawaited(widget.messageStore.saveMessage(message));
 
     unawaited(_transmit(message));
@@ -1124,18 +1252,31 @@ class _ChatPageState extends State<ChatPage> {
       builder: (_) => EmojiPickerSheet(store: widget.emojiStore),
     );
     if (sticker == null || !mounted) return;
+    final asset = await widget.emojiStore.loadAsset(sticker.id);
+    if (asset == null) {
+      if (mounted) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(const SnackBar(content: Text('未找到这张表情，请重新导入后再发送。')));
+      }
+      return;
+    }
+    final emojiSnapshot = EmojiImageSanitizer.sanitize(asset.bytes);
     final message = Message(
       id: DateTime.now().microsecondsSinceEpoch.toString(),
       sender: 'self',
       content: '[表情：${sticker.name}]',
       emojiId: sticker.id,
       emojiName: sticker.name,
+      emojiSnapshot: emojiSnapshot,
       timestamp: DateTime.now(),
       status: MessageStatus.sending,
+      transferProgress: 0,
     );
     setState(() => _messages.add(message));
+    _revealLatestMessage(shouldFollow: true);
     unawaited(widget.messageStore.saveMessage(message));
-    unawaited(_transmit(message));
+    unawaited(_transmitEmoji(message));
   }
 
   void _retryMessage(Message message) {
@@ -1144,30 +1285,130 @@ class _ChatPageState extends State<ChatPage> {
     setState(() {
       _messages[index] = message.copyWith(status: MessageStatus.sending);
     });
+    _revealLatestMessage(shouldFollow: true);
     unawaited(widget.messageStore.saveMessage(_messages[index]));
-    unawaited(_transmit(_messages[index]));
+    if (message.emojiId == null) {
+      unawaited(_transmit(_messages[index]));
+    } else {
+      unawaited(_transmitEmoji(_messages[index]));
+    }
   }
 
   Future<void> _transmit(Message message) async {
     try {
       final packet = BlePacket.fromMessage(message);
-      if (widget.discoveryService.isConnected) {
-        await widget.discoveryService.sendPacket(
-          await widget.securityRegistry.encryptForCentral(packet),
-        );
-      } else {
-        final peerId = _peripheralPeerId;
-        if (peerId == null) throw StateError('尚未建立静域通信通道');
-        await widget.peripheralService.send(
-          peerId,
-          await widget.securityRegistry.encryptForPeripheral(peerId, packet),
-        );
-      }
+      await _sendSecurePacket(packet);
       await Future<void>.delayed(const Duration(seconds: 12));
       _markFailedIfPending(message.id);
     } on Object {
       _markFailedIfPending(message.id);
     }
+  }
+
+  Future<void> _transmitEmoji(Message message) async {
+    final emojiId = message.emojiId;
+    if (emojiId == null) return _transmit(message);
+    try {
+      final asset = await widget.emojiStore.loadAsset(emojiId);
+      final sourceBytes = message.emojiSnapshot ?? asset?.bytes;
+      if (sourceBytes == null) throw StateError('未找到待发送的图片');
+      // 兼容旧版本保存在本机的 512px PNG：发送时转换为当前的 256px
+      // 传输格式。新导入图片也经过同一出口，避免两条发送路径不一致。
+      final transferBytes = EmojiImageSanitizer.sanitize(sourceBytes);
+      final chunks = EmojiTransferCodec.split(transferBytes);
+      final manifest = EmojiTransferManifest(
+        content: message.content,
+        name: message.emojiName ?? asset?.sticker.name ?? '表情',
+        timestamp: message.timestamp,
+        byteLength: transferBytes.length,
+        chunkCount: chunks.length,
+        checksum: await EmojiTransferCodec.checksum(transferBytes),
+      );
+      // 传输 ID 保持不变，因此接收端可以安全地以新的开始包覆盖残缺分片；
+      // 若某次 BLE 写入临时失败，用户无需手动点按即可完成一次自动重发。
+      for (var attempt = 0; attempt < 2; attempt++) {
+        final transfer = _OutgoingEmojiTransfer();
+        _outgoingEmojiTransfers[message.id] = transfer;
+        try {
+          await _sendEmojiTransfer(message, manifest, chunks, transfer);
+          await transfer.completion.future.timeout(const Duration(seconds: 10));
+          return;
+        } on Object {
+          if (attempt == 1) rethrow;
+          _updateTransferProgress(message.id, 0);
+          await Future<void>.delayed(const Duration(milliseconds: 500));
+        } finally {
+          if (identical(_outgoingEmojiTransfers[message.id], transfer)) {
+            _outgoingEmojiTransfers.remove(message.id);
+          }
+        }
+      }
+    } on Object {
+      _markFailedIfPending(message.id);
+    }
+  }
+
+  Future<void> _sendEmojiTransfer(
+    Message message,
+    EmojiTransferManifest manifest,
+    List<Uint8List> chunks,
+    _OutgoingEmojiTransfer transfer,
+  ) async {
+    await _sendSecurePacket(
+      BlePacket(
+        type: BlePacketType.emojiStart,
+        id: message.id,
+        payload: jsonEncode(manifest.toJson()),
+      ),
+    );
+    for (var start = 0; start < chunks.length;) {
+      final end = (start + EmojiTransferCodec.acknowledgementInterval)
+          .clamp(0, chunks.length)
+          .toInt();
+      var acknowledged = false;
+      for (var attempt = 0; attempt < 2 && !acknowledged; attempt++) {
+        for (var index = start; index < end; index++) {
+          await _sendSecurePacket(
+            BlePacket(
+              type: BlePacketType.emojiChunk,
+              id: message.id,
+              payload: EmojiTransferCodec.encodeChunk(index, chunks[index]),
+              sequence: index,
+            ),
+          );
+          _updateTransferProgress(message.id, (index + 1) / chunks.length);
+        }
+        try {
+          await transfer.waitForAcknowledgement(end - 1);
+          acknowledged = true;
+        } on TimeoutException {
+          if (attempt == 1) rethrow;
+        }
+      }
+      start = end;
+    }
+    await _sendSecurePacket(
+      BlePacket(
+        type: BlePacketType.emojiComplete,
+        id: message.id,
+        payload: manifest.checksum,
+      ),
+    );
+  }
+
+  Future<void> _sendSecurePacket(BlePacket packet) async {
+    if (widget.discoveryService.isConnected) {
+      await widget.discoveryService.sendPacket(
+        await widget.securityRegistry.encryptForCentral(packet),
+      );
+      return;
+    }
+    final peerId = _peripheralPeerId;
+    if (peerId == null) throw StateError('尚未建立静域通信通道');
+    await widget.peripheralService.send(
+      peerId,
+      await widget.securityRegistry.encryptForPeripheral(peerId, packet),
+    );
   }
 
   Future<void> _handleIncoming(
@@ -1198,6 +1439,40 @@ class _ChatPageState extends State<ChatPage> {
       _markSuccess(packet.id);
       return;
     }
+    if (packet.type == BlePacketType.acknowledgement &&
+        packet.payload == 'emoji-delivered') {
+      final completion = _outgoingEmojiTransfers[packet.id];
+      if (completion != null && !completion.completion.isCompleted) {
+        completion.completion.complete();
+      }
+      _markSuccess(packet.id);
+      return;
+    }
+    if (packet.type == BlePacketType.acknowledgement &&
+        packet.payload.startsWith('emoji-progress:')) {
+      final index = int.tryParse(
+        packet.payload.substring('emoji-progress:'.length),
+      );
+      if (index != null) {
+        _outgoingEmojiTransfers[packet.id]?.acknowledge(index);
+      }
+      return;
+    }
+    if (packet.type == BlePacketType.acknowledgement &&
+        packet.payload.startsWith('emoji-failed')) {
+      final completion = _outgoingEmojiTransfers[packet.id];
+      if (completion != null && !completion.completion.isCompleted) {
+        completion.completion.completeError(const FormatException('对方未能接收图片'));
+      }
+      _markFailedIfPending(packet.id);
+      return;
+    }
+    if (packet.type == BlePacketType.emojiStart ||
+        packet.type == BlePacketType.emojiChunk ||
+        packet.type == BlePacketType.emojiComplete) {
+      await _handleIncomingEmojiPacket(packet, acknowledge: acknowledge);
+      return;
+    }
     if (packet.type != BlePacketType.message) return;
     try {
       final payload = jsonDecode(packet.payload) as Map<String, dynamic>;
@@ -1210,8 +1485,10 @@ class _ChatPageState extends State<ChatPage> {
         emojiName: payload['emojiName'] as String?,
       );
       if (mounted && !_messages.any((item) => item.id == message.id)) {
+        final shouldFollow = _isAtBottom;
         setState(() => _messages.add(message));
         await widget.messageStore.saveMessage(message);
+        _revealLatestMessage(shouldFollow: shouldFollow);
       }
       await acknowledge(
         BlePacket(
@@ -1223,6 +1500,123 @@ class _ChatPageState extends State<ChatPage> {
     } on FormatException {
       // 丢弃无效消息包，保持会话可用。
     }
+  }
+
+  Future<void> _handleIncomingEmojiPacket(
+    BlePacket packet, {
+    required Future<void> Function(BlePacket acknowledgement) acknowledge,
+  }) async {
+    if (packet.type == BlePacketType.emojiStart) {
+      await _startIncomingEmojiTransfer(packet, acknowledge);
+      return;
+    }
+    if (packet.type == BlePacketType.emojiChunk) {
+      await _addIncomingEmojiChunk(packet, acknowledge);
+      return;
+    }
+    await _completeIncomingEmojiTransfer(packet, acknowledge);
+  }
+
+  Future<void> _startIncomingEmojiTransfer(
+    BlePacket packet,
+    Future<void> Function(BlePacket acknowledgement) acknowledge,
+  ) async {
+    if (_messages.any((message) => message.id == packet.id)) {
+      await _acknowledgeEmoji(packet.id, 'emoji-delivered', acknowledge);
+      return;
+    }
+    try {
+      final manifest = EmojiTransferManifest.fromJson(
+        jsonDecode(packet.payload) as Map<String, dynamic>,
+      );
+      _incomingEmojiTransfers[packet.id] = _IncomingEmojiTransfer(manifest);
+    } on Object catch (error) {
+      debugPrint('图片传输元数据无效：$error');
+      _incomingEmojiTransfers.remove(packet.id);
+      await _acknowledgeEmoji(packet.id, 'emoji-failed:metadata', acknowledge);
+    }
+  }
+
+  Future<void> _addIncomingEmojiChunk(
+    BlePacket packet,
+    Future<void> Function(BlePacket acknowledgement) acknowledge,
+  ) async {
+    final transfer = _incomingEmojiTransfers[packet.id];
+    if (transfer == null) {
+      await _acknowledgeEmoji(packet.id, 'emoji-failed', acknowledge);
+      return;
+    }
+    try {
+      final chunk = EmojiTransferCodec.decodeChunk(packet.payload);
+      transfer.accumulator.add(chunk.index, chunk.bytes);
+      if ((chunk.index + 1) % EmojiTransferCodec.acknowledgementInterval == 0 ||
+          chunk.index == transfer.manifest.chunkCount - 1) {
+        await _acknowledgeEmoji(
+          packet.id,
+          'emoji-progress:${chunk.index}',
+          acknowledge,
+        );
+      }
+    } on Object catch (error) {
+      debugPrint('图片分片无效：$error');
+      _incomingEmojiTransfers.remove(packet.id);
+      await _acknowledgeEmoji(packet.id, 'emoji-failed:chunk', acknowledge);
+    }
+  }
+
+  Future<void> _completeIncomingEmojiTransfer(
+    BlePacket packet,
+    Future<void> Function(BlePacket acknowledgement) acknowledge,
+  ) async {
+    final transfer = _incomingEmojiTransfers.remove(packet.id);
+    if (transfer == null || packet.payload != transfer.manifest.checksum) {
+      debugPrint('图片完成包无效或传输状态已丢失');
+      await _acknowledgeEmoji(packet.id, 'emoji-failed:complete', acknowledge);
+      return;
+    }
+    try {
+      final bytes = await transfer.accumulator.assemble();
+      final sticker = await widget.emojiStore.importTransferredImage(
+        bytes,
+        name: transfer.manifest.name,
+      );
+      final message = Message(
+        id: packet.id,
+        sender: 'nearby-device',
+        content: transfer.manifest.content,
+        emojiId: sticker.id,
+        emojiName: transfer.manifest.name,
+        emojiSnapshot: bytes,
+        timestamp: transfer.manifest.timestamp,
+      );
+      if (mounted && !_messages.any((item) => item.id == message.id)) {
+        final shouldFollow = _isAtBottom;
+        setState(() => _messages.add(message));
+        await widget.messageStore.saveMessage(message);
+        _revealLatestMessage(shouldFollow: shouldFollow);
+      }
+      await _acknowledgeEmoji(packet.id, 'emoji-delivered', acknowledge);
+    } on FormatException catch (error) {
+      debugPrint('图片完整性校验失败：$error');
+      await _acknowledgeEmoji(packet.id, 'emoji-failed:integrity', acknowledge);
+    } on Object catch (error) {
+      debugPrint('图片保存失败：$error');
+      await _acknowledgeEmoji(packet.id, 'emoji-failed:save', acknowledge);
+    }
+  }
+
+  Future<void> _acknowledgeEmoji(
+    String messageId,
+    String result,
+    Future<void> Function(BlePacket acknowledgement) acknowledge,
+  ) {
+    return acknowledge(
+      BlePacket(
+        type: BlePacketType.acknowledgement,
+        id: messageId,
+        payload: result,
+      ),
+    );
   }
 
   Future<void> _handleRemoteDisconnect() async {
@@ -1254,22 +1648,80 @@ class _ChatPageState extends State<ChatPage> {
     }
   }
 
+  void _updateTransferProgress(String id, double progress) {
+    if (!mounted) return;
+    final index = _messages.indexWhere((item) => item.id == id);
+    if (index == -1 || _messages[index].status != MessageStatus.sending) {
+      return;
+    }
+    setState(() {
+      _messages[index] = _messages[index].copyWith(
+        transferProgress: progress.clamp(0, 1).toDouble(),
+      );
+    });
+  }
+
   void _updateMessageStatus(String id, MessageStatus status) {
     if (!mounted) return;
     final index = _messages.indexWhere((item) => item.id == id);
     if (index == -1) return;
+    final shouldFollow = _isAtBottom;
     final updated = _messages[index].copyWith(status: status);
     setState(() => _messages[index] = updated);
     unawaited(widget.messageStore.saveMessage(updated));
+    if (shouldFollow) {
+      _scheduleScrollToBottom();
+    }
   }
 }
 
 enum _ChatMenuAction { disconnect }
 
+class _IncomingEmojiTransfer {
+  _IncomingEmojiTransfer(this.manifest)
+    : accumulator = EmojiTransferAccumulator(manifest);
+
+  final EmojiTransferManifest manifest;
+  final EmojiTransferAccumulator accumulator;
+}
+
+class _OutgoingEmojiTransfer {
+  final Completer<void> completion = Completer<void>();
+  int _highestAcknowledgedChunk = -1;
+  Completer<void>? _chunkWaiter;
+  int? _waitingForChunk;
+
+  Future<void> waitForAcknowledgement(int chunkIndex) {
+    if (_highestAcknowledgedChunk >= chunkIndex) return Future<void>.value();
+    final waiter = Completer<void>();
+    _chunkWaiter = waiter;
+    _waitingForChunk = chunkIndex;
+    if (_highestAcknowledgedChunk >= chunkIndex) waiter.complete();
+    return waiter.future.timeout(const Duration(seconds: 3));
+  }
+
+  void acknowledge(int chunkIndex) {
+    if (chunkIndex <= _highestAcknowledgedChunk) return;
+    _highestAcknowledgedChunk = chunkIndex;
+    final waiter = _chunkWaiter;
+    if (waiter != null &&
+        !waiter.isCompleted &&
+        _waitingForChunk != null &&
+        chunkIndex >= _waitingForChunk!) {
+      waiter.complete();
+    }
+  }
+}
+
 class SettingsPage extends StatelessWidget {
-  const SettingsPage({required this.themeController, super.key});
+  const SettingsPage({
+    required this.themeController,
+    required this.emojiStore,
+    super.key,
+  });
 
   final ThemeController themeController;
+  final EmojiStore emojiStore;
 
   @override
   Widget build(BuildContext context) {
@@ -1292,10 +1744,34 @@ class SettingsPage extends StatelessWidget {
                 _SettingsTile(
                   icon: Icons.palette_outlined,
                   title: '主题',
-                  subtitle: SilentDomainThemes.labelFor(
-                    themeController.settings.mode,
-                  ),
+                  subtitle: _themeSummary(themeController.settings),
                   onTap: () => _showThemePicker(context),
+                ),
+                const Divider(height: 1),
+                _SettingsTile(
+                  icon: Icons.tune_rounded,
+                  title: '自定义调色',
+                  subtitle:
+                      '${themeController.settings.customColorHex} · 点击继续微调',
+                  badgeColor: themeController.settings.customColor,
+                  onTap: () =>
+                      _showThemePicker(context, openCustomEditor: true),
+                ),
+              ],
+            ),
+            const SizedBox(height: 20),
+            _SettingsSection(
+              title: '本地内容',
+              children: [
+                _SettingsTile(
+                  icon: Icons.emoji_emotions_outlined,
+                  title: '表情与附件',
+                  subtitle: '管理我的表情与聊天图片缓存',
+                  onTap: () => Navigator.of(context).push(
+                    MaterialPageRoute<void>(
+                      builder: (_) => EmojiManagementPage(store: emojiStore),
+                    ),
+                  ),
                 ),
               ],
             ),
@@ -1332,11 +1808,21 @@ class SettingsPage extends StatelessWidget {
     );
   }
 
-  void _showThemePicker(BuildContext context) {
+  String _themeSummary(ThemeSettings settings) {
+    if (settings.mode != AppThemeMode.custom) {
+      return SilentDomainThemes.labelFor(settings.mode);
+    }
+    return '自定义颜色 · ${settings.customColorHex}';
+  }
+
+  void _showThemePicker(BuildContext context, {bool openCustomEditor = false}) {
     showModalBottomSheet<void>(
       context: context,
       showDragHandle: true,
-      builder: (_) => ThemePickerSheet(controller: themeController),
+      builder: (_) => ThemePickerSheet(
+        controller: themeController,
+        openCustomEditor: openCustomEditor,
+      ),
     );
   }
 }
@@ -1512,6 +1998,10 @@ class _MessageBubble extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final mine = message.sender == 'self';
+    final legacyEmojiName = message.emojiId == null
+        ? _legacyEmojiNameFromContent(message.content)
+        : null;
+    final isEmoji = message.emojiId != null || legacyEmojiName != null;
     final time =
         '${message.timestamp.hour.toString().padLeft(2, '0')}:${message.timestamp.minute.toString().padLeft(2, '0')}';
     return Align(
@@ -1526,7 +2016,7 @@ class _MessageBubble extends StatelessWidget {
             Row(
               mainAxisSize: MainAxisSize.min,
               children: [
-                if (message.emojiId == null)
+                if (!isEmoji)
                   Container(
                     constraints: const BoxConstraints(maxWidth: 290),
                     padding: const EdgeInsets.symmetric(
@@ -1547,10 +2037,12 @@ class _MessageBubble extends StatelessWidget {
                   )
                 else
                   EmojiMessageContent(
-                    emojiId: message.emojiId!,
-                    emojiName: message.emojiName ?? '表情',
+                    emojiId: message.emojiId,
+                    emojiName: message.emojiName ?? legacyEmojiName ?? '表情',
+                    emojiSnapshot: message.emojiSnapshot,
                     emojiStore: emojiStore,
                     color: mine ? Colors.white : const Color(0xFF24354A),
+                    canSaveAsSticker: !mine && message.emojiId != null,
                   ),
                 if (mine && message.status == MessageStatus.failed)
                   IconButton(
@@ -1562,13 +2054,25 @@ class _MessageBubble extends StatelessWidget {
                     ),
                   ),
                 if (mine && message.status == MessageStatus.sending)
-                  const Padding(
-                    padding: EdgeInsets.only(left: 8),
-                    child: SizedBox(
-                      width: 15,
-                      height: 15,
-                      child: CircularProgressIndicator(strokeWidth: 2),
-                    ),
+                  Padding(
+                    padding: const EdgeInsets.only(left: 8),
+                    child: message.transferProgress == null
+                        ? const SizedBox(
+                            width: 15,
+                            height: 15,
+                            child: CircularProgressIndicator(strokeWidth: 2),
+                          )
+                        : SizedBox(
+                            width: 42,
+                            child: Text(
+                              '${(message.transferProgress! * 100).round()}%',
+                              textAlign: TextAlign.center,
+                              style: const TextStyle(
+                                fontSize: 12,
+                                color: Color(0xFF718096),
+                              ),
+                            ),
+                          ),
                   ),
               ],
             ),
@@ -1582,6 +2086,12 @@ class _MessageBubble extends StatelessWidget {
       ),
     );
   }
+}
+
+String? _legacyEmojiNameFromContent(String content) {
+  final match = RegExp(r'^\[表情[：:]\s*(.+)\]$').firstMatch(content.trim());
+  final name = match?.group(1)?.trim();
+  return name == null || name.isEmpty ? null : name;
 }
 
 class _SettingsSection extends StatelessWidget {
@@ -1620,12 +2130,14 @@ class _SettingsTile extends StatelessWidget {
     required this.icon,
     required this.title,
     required this.subtitle,
+    this.badgeColor,
     this.onTap,
   });
 
   final IconData icon;
   final String title;
   final String subtitle;
+  final Color? badgeColor;
   final VoidCallback? onTap;
 
   @override
@@ -1634,7 +2146,16 @@ class _SettingsTile extends StatelessWidget {
       leading: Icon(icon, color: Theme.of(context).colorScheme.primary),
       title: Text(title),
       subtitle: Text(subtitle),
-      trailing: const Icon(Icons.chevron_right_rounded),
+      trailing: badgeColor == null
+          ? const Icon(Icons.chevron_right_rounded)
+          : Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                CircleAvatar(radius: 11, backgroundColor: badgeColor),
+                const SizedBox(width: 8),
+                const Icon(Icons.chevron_right_rounded),
+              ],
+            ),
       onTap: onTap,
     );
   }

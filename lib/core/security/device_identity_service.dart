@@ -440,7 +440,8 @@ class SessionSecurityRegistry {
     );
     final plaintextBytes = utf8.encode(plaintext);
     if (plaintextBytes.isEmpty ||
-        plaintextBytes.first >= BlePacketType.encrypted.index) {
+        plaintextBytes.first >= BlePacketType.values.length ||
+        plaintextBytes.first == BlePacketType.encrypted.index) {
       throw const FormatException('加密消息类型无效');
     }
     return BlePacket(

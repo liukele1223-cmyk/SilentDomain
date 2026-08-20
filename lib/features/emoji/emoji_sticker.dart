@@ -7,6 +7,8 @@ class EmojiSticker {
     required this.name,
     required this.path,
     required this.createdAt,
+    this.byteLength = 0,
+    this.isLocalSticker = true,
   });
 
   final String id;
@@ -15,6 +17,12 @@ class EmojiSticker {
   /// 加密资料库中的逻辑路径，不暴露用户相册原始路径。
   final String path;
   final DateTime createdAt;
+
+  /// 加密资料库中图片数据的大小，仅用于本机存储占用展示。
+  final int byteLength;
+
+  /// 是否已由用户保存到“我的表情”。接收附件默认不会加入该列表。
+  final bool isLocalSticker;
 }
 
 /// 解密后仅在内存中使用的表情图像数据。

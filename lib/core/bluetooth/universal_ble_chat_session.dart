@@ -18,9 +18,13 @@ class UniversalBleChatSession implements BleChatSession {
   CharacteristicSubscription? _subscription;
 
   int? _frameTotal;
+  int? _frameTransferId;
   final Map<int, List<int>> _frames = <int, List<int>>{};
   Future<void> _sendQueue = Future<void>.value();
   bool _closed = false;
+
+  static const _maximumWriteAttempts = 5;
+  static const _writeTimeout = Duration(seconds: 2);
 
   /// 发现服务并打开会话。通知订阅由 [subscribeNotifications] 单独启动，
   /// 以便连接请求先通过写入特征抵达外围端。
@@ -120,13 +124,27 @@ class UniversalBleChatSession implements BleChatSession {
     // 所有帧使用有响应写入，长消息的速度来自协商到的更大 MTU。实测当前
     // Android 组合会丢弃无响应长写入，因此优先保证逐条消息可靠送达。
     for (var index = 0; index < frames.length; index++) {
-      await UniversalBle.write(
-        deviceId,
-        SilentDomainBleUuid.service,
-        SilentDomainBleUuid.writeCharacteristic,
-        frames[index],
-        withoutResponse: false,
-      );
+      await _writeFrameWithRetry(frames[index]);
+    }
+  }
+
+  /// Android 在连续有响应写入时可能短暂报告繁忙。该错误通常不代表链路
+  /// 已断开，重试当前帧可避免整张图片在接近完成时直接失败。
+  Future<void> _writeFrameWithRetry(Uint8List frame) async {
+    for (var attempt = 0; attempt < _maximumWriteAttempts; attempt++) {
+      try {
+        await UniversalBle.write(
+          deviceId,
+          SilentDomainBleUuid.service,
+          SilentDomainBleUuid.writeCharacteristic,
+          frame,
+          withoutResponse: false,
+        ).timeout(_writeTimeout);
+        return;
+      } on Object {
+        if (attempt == _maximumWriteAttempts - 1) rethrow;
+        await Future<void>.delayed(Duration(milliseconds: 60 * (attempt + 1)));
+      }
     }
   }
 
@@ -134,8 +152,9 @@ class UniversalBleChatSession implements BleChatSession {
     if (_closed) return;
     try {
       final frame = BleFrameCodec.decode(value);
-      if (_frameTotal != frame.total) {
+      if (_frameTransferId != frame.transferId || _frameTotal != frame.total) {
         _frameTotal = frame.total;
+        _frameTransferId = frame.transferId;
         _frames.clear();
       }
       _frames[frame.index] = frame.payload;
@@ -150,6 +169,7 @@ class UniversalBleChatSession implements BleChatSession {
       _incomingController.add(bytes);
       _frames.clear();
       _frameTotal = null;
+      _frameTransferId = null;
     } on FormatException {
       // 丢弃非法帧，避免单个 BLE 数据包中断整个会话。
     }

@@ -10,7 +10,15 @@ abstract final class SilentDomainBleUuid {
   static const notifyCharacteristic = '7e3a0003-4b9a-4c1d-9e2a-53494c454e54';
 }
 
-enum BlePacketType { hello, message, acknowledgement, encrypted }
+enum BlePacketType {
+  hello,
+  message,
+  acknowledgement,
+  emojiStart,
+  emojiChunk,
+  emojiComplete,
+  encrypted,
+}
 
 class BlePacket {
   const BlePacket({
@@ -67,9 +75,10 @@ class BlePacket {
 /// 将一个 BLE 数据包切成不超过 MTU 友好长度的帧。
 abstract final class BleFrameCodec {
   // 在未协商 MTU 的 Android BLE 连接中，默认 ATT MTU 常为 23 字节。
-  // 保留 4 字节帧头后，单帧最多 20 字节，确保小米与荣耀等设备都能写入。
+  // 保留 6 字节帧头后，单帧最多 20 字节，确保小米与荣耀等设备都能写入。
   static const payloadSize = 20;
-  static const _headerSize = 4;
+  static const _headerSize = 6;
+  static int _nextTransferId = 0;
 
   static List<Uint8List> split(
     Uint8List bytes, {
@@ -80,6 +89,10 @@ abstract final class BleFrameCodec {
     }
     final chunkSize = maxFrameSize - _headerSize;
     final total = (bytes.length / chunkSize).ceil().clamp(1, 65535);
+    // 每个逻辑 BLE 数据包都有一个帧组编号。即使 Android 蓝牙栈在高负载
+    // 时延后派发了旧通知，也不会把它与下一条恰好同样长度的消息拼在一起。
+    _nextTransferId = (_nextTransferId + 1) & 0xffff;
+    final transferId = _nextTransferId;
     return List.generate(total, (index) {
       final start = index * chunkSize;
       final end = (start + chunkSize).clamp(0, bytes.length);
@@ -87,6 +100,7 @@ abstract final class BleFrameCodec {
       final data = ByteData.sublistView(frame);
       data.setUint16(0, index);
       data.setUint16(2, total);
+      data.setUint16(4, transferId);
       frame.setRange(_headerSize, frame.length, bytes, start);
       return frame;
     });
@@ -105,6 +119,7 @@ abstract final class BleFrameCodec {
     return Frame(
       index: index,
       total: total,
+      transferId: data.getUint16(4),
       payload: frame.sublist(_headerSize),
     );
   }
@@ -114,11 +129,13 @@ class Frame {
   const Frame({
     required this.index,
     required this.total,
+    required this.transferId,
     required this.payload,
   });
 
   final int index;
   final int total;
+  final int transferId;
   final List<int> payload;
 }
 

@@ -43,3 +43,13 @@ app.*.map.json
 /android/app/debug
 /android/app/profile
 /android/app/release
+
+# Local signing, SDK and environment configuration. Never commit credentials
+# or device-specific paths.
+/android/local.properties
+/android/key.properties
+*.jks
+*.keystore
+.env
+.env.*
+!.env.example

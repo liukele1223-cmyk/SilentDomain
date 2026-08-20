@@ -11,15 +11,21 @@ class EmojiImportService {
 
   final ImagePicker _picker;
 
-  Future<EmojiSticker?> importFromGallery(EmojiStore store) async {
-    final selected = await _picker.pickImage(
-      source: ImageSource.gallery,
+  /// 由系统相册负责多选；应用只在用户确认后读取被选图片的字节。
+  Future<List<EmojiSticker>> importFromGallery(EmojiStore store) async {
+    final selected = await _picker.pickMultiImage(
       maxWidth: 1024,
       maxHeight: 1024,
       requestFullMetadata: false,
     );
-    if (selected == null) return null;
-    final bytes = Uint8List.fromList(await selected.readAsBytes());
-    return store.importImage(bytes);
+    if (selected.isEmpty) return const [];
+    final sourceBytes = await Future.wait<Uint8List>(
+      selected.map(
+        (file) async => Uint8List.fromList(await file.readAsBytes()),
+      ),
+    );
+    return Future.wait<EmojiSticker>(
+      sourceBytes.map((bytes) => store.importImage(bytes)),
+    );
   }
 }

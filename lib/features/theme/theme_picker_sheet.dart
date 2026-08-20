@@ -4,9 +4,14 @@ import 'theme_settings.dart';
 
 /// Material 3 主题选择面板，包含三个内置主题和 RGB 自定义颜色。
 class ThemePickerSheet extends StatefulWidget {
-  const ThemePickerSheet({required this.controller, super.key});
+  const ThemePickerSheet({
+    required this.controller,
+    this.openCustomEditor = false,
+    super.key,
+  });
 
   final ThemeController controller;
+  final bool openCustomEditor;
 
   @override
   State<ThemePickerSheet> createState() => _ThemePickerSheetState();
@@ -16,14 +21,21 @@ class _ThemePickerSheetState extends State<ThemePickerSheet> {
   late int _red;
   late int _green;
   late int _blue;
+  late bool _showCustomControls;
 
   @override
   void initState() {
     super.initState();
     final color = widget.controller.settings.customColor;
-    _red = color.r.toInt();
-    _green = color.g.toInt();
-    _blue = color.b.toInt();
+    // 使用标准 24 位 sRGB 值还原滑杆位置。Color.r/g/b 是 0~1 的浮点值，
+    // 直接取整会把大多数颜色错误地恢复成 0（黑色）。
+    final value = color.toARGB32();
+    _red = (value >> 16) & 0xFF;
+    _green = (value >> 8) & 0xFF;
+    _blue = value & 0xFF;
+    _showCustomControls =
+        widget.openCustomEditor ||
+        widget.controller.settings.mode == AppThemeMode.custom;
   }
 
   Color get _customColor => Color.fromARGB(255, _red, _green, _blue);
@@ -60,15 +72,18 @@ class _ThemePickerSheetState extends State<ThemePickerSheet> {
                   option: _ThemeOptionData(
                     mode: AppThemeMode.custom,
                     title: '自定义颜色',
-                    subtitle:
-                        '#${_customColor.toARGB32().toRadixString(16).substring(2).toUpperCase()}',
+                    subtitle: ThemeSettings(
+                      customColorValue: _customColor.toARGB32(),
+                    ).customColorHex,
                     color: _customColor,
                   ),
                   selected: selected == AppThemeMode.custom,
-                  onTap: () =>
-                      widget.controller.selectCustomColor(_customColor),
+                  onTap: () {
+                    setState(() => _showCustomControls = true);
+                    widget.controller.selectCustomColor(_customColor);
+                  },
                 ),
-                if (selected == AppThemeMode.custom) ...[
+                if (_showCustomControls) ...[
                   const SizedBox(height: 6),
                   _RgbSlider(
                     label: '红',

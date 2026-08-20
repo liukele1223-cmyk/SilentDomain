@@ -18,6 +18,9 @@ class ThemeSettings {
 
   Color get customColor => Color(customColorValue);
 
+  String get customColorHex =>
+      '#${customColor.toARGB32().toRadixString(16).substring(2).toUpperCase()}';
+
   ThemeSettings copyWith({AppThemeMode? mode, int? customColorValue}) {
     return ThemeSettings(
       mode: mode ?? this.mode,

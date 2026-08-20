@@ -264,6 +264,11 @@ class FakeDiscoveryService implements DiscoveryService {
     _incomingController.add(packet);
   }
 
+  /// 测试辅助入口：模拟另一台设备送达的数据包。
+  void emitIncomingPacket(BlePacket packet) {
+    _incomingController.add(packet);
+  }
+
   @override
   Future<void> dispose() async {
     await _controller.close();
