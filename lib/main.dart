@@ -7,9 +7,13 @@ import 'package:flutter/material.dart';
 
 import 'core/bluetooth/discovery_service.dart';
 import 'core/bluetooth/ble_protocol.dart';
+import 'core/bluetooth/ble_background_service.dart';
 import 'core/bluetooth/universal_ble_peripheral_chat.dart';
+import 'core/database/image_transfer_metrics_store.dart';
 import 'core/database/message_store.dart';
 import 'core/security/device_identity_service.dart';
+import 'features/diagnostics/image_transfer_metrics_recorder.dart';
+import 'features/diagnostics/transfer_diagnostics_page.dart';
 import 'features/emoji/emoji_message_content.dart';
 import 'features/emoji/emoji_management_page.dart';
 import 'features/emoji/emoji_picker_sheet.dart';
@@ -19,11 +23,13 @@ import 'features/emoji/emoji_transfer.dart';
 import 'features/theme/theme_settings.dart';
 import 'features/theme/theme_picker_sheet.dart';
 import 'models/message.dart';
+import 'models/image_transfer_metric.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   final messageStore = await HiveMessageStore.create();
   final emojiStore = await HiveEmojiStore.create();
+  final imageTransferMetricsStore = await _createImageTransferMetricsStore();
   final themeController = ThemeController(await ThemeStore.create());
   await themeController.load();
   final securityRegistry = SessionSecurityRegistry();
@@ -31,6 +37,7 @@ Future<void> main() async {
     SilentDomainApp(
       messageStore: messageStore,
       emojiStore: emojiStore,
+      imageTransferMetricsStore: imageTransferMetricsStore,
       themeController: themeController,
       discoveryService: BleDiscoveryService(securityRegistry: securityRegistry),
       peripheralService: UniversalBlePeripheralChat(),
@@ -39,17 +46,38 @@ Future<void> main() async {
   );
 }
 
+Future<ImageTransferMetricsStore> _createImageTransferMetricsStore() async {
+  try {
+    return await HiveImageTransferMetricsStore.create();
+  } on Object {
+    // 诊断资料库不可用时仅停用本次持久化，聊天与图片传输继续工作。
+    return MemoryImageTransferMetricsStore();
+  }
+}
+
+String? _backgroundServiceWarning(BleBackgroundStartStatus status) {
+  return switch (status) {
+    BleBackgroundStartStatus.notificationVisible => null,
+    BleBackgroundStartStatus.notificationUnavailable =>
+      '后台保活已运行，但通知权限未开启，系统常驻通知可能不可见。',
+    BleBackgroundStartStatus.failed => '后台接收保活不可用，请保持静域在前台。',
+  };
+}
+
 class SilentDomainApp extends StatelessWidget {
   SilentDomainApp({
     super.key,
     MessageStore? messageStore,
     EmojiStore? emojiStore,
+    ImageTransferMetricsStore? imageTransferMetricsStore,
     ThemeController? themeController,
     DiscoveryService? discoveryService,
     UniversalBlePeripheralChat? peripheralService,
     SessionSecurityRegistry? securityRegistry,
   }) : messageStore = messageStore ?? MemoryMessageStore(),
        emojiStore = emojiStore ?? MemoryEmojiStore(),
+       imageTransferMetricsStore =
+           imageTransferMetricsStore ?? MemoryImageTransferMetricsStore(),
        themeController = themeController ?? ThemeController(null),
        discoveryService = discoveryService ?? FakeDiscoveryService(),
        peripheralService = peripheralService ?? UniversalBlePeripheralChat(),
@@ -57,6 +85,7 @@ class SilentDomainApp extends StatelessWidget {
 
   final MessageStore messageStore;
   final EmojiStore emojiStore;
+  final ImageTransferMetricsStore imageTransferMetricsStore;
   final ThemeController themeController;
   final DiscoveryService discoveryService;
   final UniversalBlePeripheralChat peripheralService;
@@ -76,6 +105,7 @@ class SilentDomainApp extends StatelessWidget {
         home: SplashPage(
           messageStore: messageStore,
           emojiStore: emojiStore,
+          imageTransferMetricsStore: imageTransferMetricsStore,
           themeController: themeController,
           discoveryService: discoveryService,
           peripheralService: peripheralService,
@@ -90,6 +120,7 @@ class SplashPage extends StatefulWidget {
   const SplashPage({
     required this.messageStore,
     required this.emojiStore,
+    required this.imageTransferMetricsStore,
     required this.themeController,
     required this.discoveryService,
     required this.peripheralService,
@@ -99,6 +130,7 @@ class SplashPage extends StatefulWidget {
 
   final MessageStore messageStore;
   final EmojiStore emojiStore;
+  final ImageTransferMetricsStore imageTransferMetricsStore;
   final ThemeController themeController;
   final DiscoveryService discoveryService;
   final UniversalBlePeripheralChat peripheralService;
@@ -128,6 +160,7 @@ class _SplashPageState extends State<SplashPage>
             builder: (_) => AppShell(
               messageStore: widget.messageStore,
               emojiStore: widget.emojiStore,
+              imageTransferMetricsStore: widget.imageTransferMetricsStore,
               themeController: widget.themeController,
               discoveryService: widget.discoveryService,
               peripheralService: widget.peripheralService,
@@ -183,6 +216,7 @@ class AppShell extends StatefulWidget {
   const AppShell({
     required this.messageStore,
     required this.emojiStore,
+    required this.imageTransferMetricsStore,
     required this.themeController,
     required this.discoveryService,
     required this.peripheralService,
@@ -192,6 +226,7 @@ class AppShell extends StatefulWidget {
 
   final MessageStore messageStore;
   final EmojiStore emojiStore;
+  final ImageTransferMetricsStore imageTransferMetricsStore;
   final ThemeController themeController;
   final DiscoveryService discoveryService;
   final UniversalBlePeripheralChat peripheralService;
@@ -216,6 +251,7 @@ class _AppShellState extends State<AppShell> {
       ChatPage(
         messageStore: widget.messageStore,
         emojiStore: widget.emojiStore,
+        imageTransferMetricsStore: widget.imageTransferMetricsStore,
         discoveryService: widget.discoveryService,
         peripheralService: widget.peripheralService,
         securityRegistry: widget.securityRegistry,
@@ -223,6 +259,7 @@ class _AppShellState extends State<AppShell> {
       SettingsPage(
         themeController: widget.themeController,
         emojiStore: widget.emojiStore,
+        imageTransferMetricsStore: widget.imageTransferMetricsStore,
       ),
     ];
     return Scaffold(
@@ -472,6 +509,14 @@ class _HomePageState extends State<HomePage> {
             payload: jsonEncode(response.toJson()),
           ),
         );
+        final backgroundStatus =
+            await BleBackgroundService.startForConnectedSession();
+        final backgroundWarning = _backgroundServiceWarning(backgroundStatus);
+        if (backgroundWarning != null && mounted) {
+          ScaffoldMessenger.of(
+            context,
+          ).showSnackBar(SnackBar(content: Text(backgroundWarning)));
+        }
       }
     } finally {
       _pairingDialogVisible = false;
@@ -799,7 +844,14 @@ class _ConnectionRequestPageState extends State<ConnectionRequestPage> {
         widget.device,
         verificationCode: _verificationCode,
       );
-      if (mounted) setState(() => _connected = true);
+      final backgroundStatus =
+          await BleBackgroundService.startForConnectedSession();
+      if (mounted) {
+        setState(() {
+          _connected = true;
+          _error = _backgroundServiceWarning(backgroundStatus);
+        });
+      }
     } on Object catch (error) {
       if (mounted) {
         setState(() => _error = _friendlyConnectionError(error));
@@ -830,6 +882,7 @@ class ChatPage extends StatefulWidget {
   const ChatPage({
     required this.messageStore,
     required this.emojiStore,
+    required this.imageTransferMetricsStore,
     required this.discoveryService,
     required this.peripheralService,
     required this.securityRegistry,
@@ -838,6 +891,7 @@ class ChatPage extends StatefulWidget {
 
   final MessageStore messageStore;
   final EmojiStore emojiStore;
+  final ImageTransferMetricsStore imageTransferMetricsStore;
   final DiscoveryService discoveryService;
   final UniversalBlePeripheralChat peripheralService;
   final SessionSecurityRegistry securityRegistry;
@@ -847,6 +901,8 @@ class ChatPage extends StatefulWidget {
 }
 
 class _ChatPageState extends State<ChatPage> {
+  static const _incomingTransferInactivityTimeout = Duration(seconds: 15);
+
   final _controller = TextEditingController();
   final _scrollController = ScrollController();
   final _messages = <Message>[];
@@ -864,10 +920,14 @@ class _ChatPageState extends State<ChatPage> {
   Future<void> _centralIncomingQueue = Future<void>.value();
   final Map<String, Future<void>> _peripheralIncomingQueues =
       <String, Future<void>>{};
+  late final ImageTransferMetricsRecorder _imageTransferMetricsRecorder;
 
   @override
   void initState() {
     super.initState();
+    _imageTransferMetricsRecorder = ImageTransferMetricsRecorder(
+      widget.imageTransferMetricsStore,
+    );
     _scrollController.addListener(_handleChatScroll);
     _centralPackets = widget.discoveryService.incomingPackets.listen(
       _enqueueCentralPacket,
@@ -920,6 +980,11 @@ class _ChatPageState extends State<ChatPage> {
   void dispose() {
     _centralPackets?.cancel();
     _peripheralPackets?.cancel();
+    for (final transfer in _incomingEmojiTransfers.values) {
+      transfer.inactivityTimer?.cancel();
+      transfer.metrics.finishFailure(ImageTransferFailureCategory.cancelled);
+    }
+    _incomingEmojiTransfers.clear();
     _controller.dispose();
     _scrollController
       ..removeListener(_handleChatScroll)
@@ -1221,6 +1286,8 @@ class _ChatPageState extends State<ChatPage> {
           context,
         ).showSnackBar(const SnackBar(content: Text('连接已在本机断开')));
       }
+    } finally {
+      await BleBackgroundService.stop();
     }
   }
 
@@ -1308,14 +1375,27 @@ class _ChatPageState extends State<ChatPage> {
   Future<void> _transmitEmoji(Message message) async {
     final emojiId = message.emojiId;
     if (emojiId == null) return _transmit(message);
+    final metrics = _imageTransferMetricsRecorder.start(
+      direction: ImageTransferDirection.outgoing,
+    );
+    var highPerformanceAcquired = false;
     try {
+      await _configureOutgoingImageTransport(metrics);
       final asset = await widget.emojiStore.loadAsset(emojiId);
       final sourceBytes = message.emojiSnapshot ?? asset?.bytes;
-      if (sourceBytes == null) throw StateError('未找到待发送的图片');
+      if (sourceBytes == null) {
+        throw const _ImageTransferFailure(ImageTransferFailureCategory.storage);
+      }
       // 兼容旧版本保存在本机的 512px PNG：发送时转换为当前的 256px
       // 传输格式。新导入图片也经过同一出口，避免两条发送路径不一致。
       final transferBytes = EmojiImageSanitizer.sanitize(sourceBytes);
       final chunks = EmojiTransferCodec.split(transferBytes);
+      metrics.setPayload(
+        inputByteLength: sourceBytes.length,
+        transferByteLength: transferBytes.length,
+        chunkCount: chunks.length,
+      );
+      metrics.markProgress();
       final manifest = EmojiTransferManifest(
         content: message.content,
         name: message.emojiName ?? asset?.sticker.name ?? '表情',
@@ -1324,14 +1404,32 @@ class _ChatPageState extends State<ChatPage> {
         chunkCount: chunks.length,
         checksum: await EmojiTransferCodec.checksum(transferBytes),
       );
+      if (widget.discoveryService.isConnected) {
+        highPerformanceAcquired = await widget.discoveryService
+            .acquireHighPerformanceConnection();
+        metrics.setConnectionPriority(
+          highPerformanceAcquired
+              ? ImageTransferConnectionPriority.highPerformanceAccepted
+              : ImageTransferConnectionPriority.requestFailed,
+        );
+      }
       // 传输 ID 保持不变，因此接收端可以安全地以新的开始包覆盖残缺分片；
       // 若某次 BLE 写入临时失败，用户无需手动点按即可完成一次自动重发。
       for (var attempt = 0; attempt < 2; attempt++) {
-        final transfer = _OutgoingEmojiTransfer();
+        if (attempt > 0) metrics.incrementRetry();
+        final transfer = _OutgoingEmojiTransfer(metrics);
         _outgoingEmojiTransfers[message.id] = transfer;
         try {
-          await _sendEmojiTransfer(message, manifest, chunks, transfer);
+          await _sendEmojiTransfer(
+            message,
+            manifest,
+            chunks,
+            transfer,
+            metrics,
+          );
           await transfer.completion.future.timeout(const Duration(seconds: 10));
+          metrics.markProgress();
+          metrics.finishSuccess();
           return;
         } on Object {
           if (attempt == 1) rethrow;
@@ -1343,9 +1441,34 @@ class _ChatPageState extends State<ChatPage> {
           }
         }
       }
-    } on Object {
+    } on Object catch (error) {
+      metrics.finishFailure(_outgoingFailureCategory(error));
       _markFailedIfPending(message.id);
+    } finally {
+      await widget.discoveryService.releaseHighPerformanceConnection(
+        acquired: highPerformanceAcquired,
+      );
     }
+  }
+
+  Future<void> _configureOutgoingImageTransport(
+    ImageTransferMetricSession metrics,
+  ) async {
+    if (widget.discoveryService.isConnected) {
+      metrics.setTransport(
+        path: ImageTransferTransportPath.centralWrite,
+        maximumBleFrameSize: widget.discoveryService.maximumFrameSize,
+      );
+      return;
+    }
+    final peerId = _peripheralPeerId;
+    if (peerId == null) return;
+    final maximumFrameSize = await widget.peripheralService
+        .resolveMaximumFrameSize(peerId);
+    metrics.setTransport(
+      path: ImageTransferTransportPath.peripheralNotification,
+      maximumBleFrameSize: maximumFrameSize,
+    );
   }
 
   Future<void> _sendEmojiTransfer(
@@ -1353,6 +1476,7 @@ class _ChatPageState extends State<ChatPage> {
     EmojiTransferManifest manifest,
     List<Uint8List> chunks,
     _OutgoingEmojiTransfer transfer,
+    ImageTransferMetricSession metrics,
   ) async {
     await _sendSecurePacket(
       BlePacket(
@@ -1361,6 +1485,7 @@ class _ChatPageState extends State<ChatPage> {
         payload: jsonEncode(manifest.toJson()),
       ),
     );
+    metrics.markProgress();
     for (var start = 0; start < chunks.length;) {
       final end = (start + EmojiTransferCodec.acknowledgementInterval)
           .clamp(0, chunks.length)
@@ -1376,13 +1501,16 @@ class _ChatPageState extends State<ChatPage> {
               sequence: index,
             ),
           );
+          metrics.markProgress();
           _updateTransferProgress(message.id, (index + 1) / chunks.length);
         }
         try {
           await transfer.waitForAcknowledgement(end - 1);
+          metrics.markProgress();
           acknowledged = true;
         } on TimeoutException {
           if (attempt == 1) rethrow;
+          metrics.incrementBatchRetry();
         }
       }
       start = end;
@@ -1394,6 +1522,19 @@ class _ChatPageState extends State<ChatPage> {
         payload: manifest.checksum,
       ),
     );
+    metrics.markProgress();
+  }
+
+  ImageTransferFailureCategory _outgoingFailureCategory(Object error) {
+    if (error is _ImageTransferFailure) return error.category;
+    if (error is TimeoutException) {
+      return ImageTransferFailureCategory.timeout;
+    }
+    if (error is FormatException || error is ArgumentError) {
+      return ImageTransferFailureCategory.validation;
+    }
+    if (error is StateError) return ImageTransferFailureCategory.transport;
+    return ImageTransferFailureCategory.unknown;
   }
 
   Future<void> _sendSecurePacket(BlePacket packet) async {
@@ -1443,6 +1584,7 @@ class _ChatPageState extends State<ChatPage> {
         packet.payload == 'emoji-delivered') {
       final completion = _outgoingEmojiTransfers[packet.id];
       if (completion != null && !completion.completion.isCompleted) {
+        completion.metrics.markProgress();
         completion.completion.complete();
       }
       _markSuccess(packet.id);
@@ -1462,9 +1604,11 @@ class _ChatPageState extends State<ChatPage> {
         packet.payload.startsWith('emoji-failed')) {
       final completion = _outgoingEmojiTransfers[packet.id];
       if (completion != null && !completion.completion.isCompleted) {
-        completion.completion.completeError(const FormatException('对方未能接收图片'));
+        completion.metrics.markProgress();
+        completion.completion.completeError(
+          _ImageTransferFailure(_remoteFailureCategory(packet.payload)),
+        );
       }
-      _markFailedIfPending(packet.id);
       return;
     }
     if (packet.type == BlePacketType.emojiStart ||
@@ -1502,6 +1646,21 @@ class _ChatPageState extends State<ChatPage> {
     }
   }
 
+  ImageTransferFailureCategory _remoteFailureCategory(String result) {
+    if (result.endsWith(':integrity')) {
+      return ImageTransferFailureCategory.integrity;
+    }
+    if (result.endsWith(':save')) {
+      return ImageTransferFailureCategory.storage;
+    }
+    if (result.endsWith(':metadata') ||
+        result.endsWith(':chunk') ||
+        result.endsWith(':complete')) {
+      return ImageTransferFailureCategory.validation;
+    }
+    return ImageTransferFailureCategory.transport;
+  }
+
   Future<void> _handleIncomingEmojiPacket(
     BlePacket packet, {
     required Future<void> Function(BlePacket acknowledgement) acknowledge,
@@ -1529,10 +1688,42 @@ class _ChatPageState extends State<ChatPage> {
       final manifest = EmojiTransferManifest.fromJson(
         jsonDecode(packet.payload) as Map<String, dynamic>,
       );
-      _incomingEmojiTransfers[packet.id] = _IncomingEmojiTransfer(manifest);
-    } on Object catch (error) {
-      debugPrint('图片传输元数据无效：$error');
-      _incomingEmojiTransfers.remove(packet.id);
+      final existing = _incomingEmojiTransfers[packet.id];
+      if (existing != null && existing.matches(manifest)) {
+        existing.metrics.incrementRetry();
+        existing.reset();
+        existing.metrics.markProgress();
+        _scheduleIncomingTransferTimeout(packet.id, existing);
+        return;
+      }
+      if (existing != null) {
+        _removeIncomingTransfer(
+          packet.id,
+          existing,
+          ImageTransferFailureCategory.validation,
+        );
+      }
+      final metrics = _imageTransferMetricsRecorder.start(
+        direction: ImageTransferDirection.incoming,
+        inputByteLength: manifest.byteLength,
+        transferByteLength: manifest.byteLength,
+        chunkCount: manifest.chunkCount,
+      );
+      metrics.markProgress();
+      final transfer = _IncomingEmojiTransfer(manifest, metrics);
+      _incomingEmojiTransfers[packet.id] = transfer;
+      _scheduleIncomingTransferTimeout(packet.id, transfer);
+    } on Object {
+      final existing = _incomingEmojiTransfers[packet.id];
+      if (existing != null) {
+        _removeIncomingTransfer(
+          packet.id,
+          existing,
+          ImageTransferFailureCategory.validation,
+        );
+      } else {
+        _recordRejectedIncoming(ImageTransferFailureCategory.validation);
+      }
       await _acknowledgeEmoji(packet.id, 'emoji-failed:metadata', acknowledge);
     }
   }
@@ -1543,24 +1734,44 @@ class _ChatPageState extends State<ChatPage> {
   ) async {
     final transfer = _incomingEmojiTransfers[packet.id];
     if (transfer == null) {
+      _recordRejectedIncoming(ImageTransferFailureCategory.validation);
       await _acknowledgeEmoji(packet.id, 'emoji-failed', acknowledge);
       return;
     }
+    var shouldAcknowledgeProgress = false;
+    var acknowledgedChunkIndex = -1;
     try {
       final chunk = EmojiTransferCodec.decodeChunk(packet.payload);
+      final isDuplicate = transfer.accumulator.hasChunk(chunk.index);
       transfer.accumulator.add(chunk.index, chunk.bytes);
+      if (isDuplicate) {
+        final batch = chunk.index ~/ EmojiTransferCodec.acknowledgementInterval;
+        if (transfer.retriedBatches.add(batch)) {
+          transfer.metrics.incrementBatchRetry();
+        }
+      }
+      transfer.metrics.markProgress();
+      _scheduleIncomingTransferTimeout(packet.id, transfer);
       if ((chunk.index + 1) % EmojiTransferCodec.acknowledgementInterval == 0 ||
           chunk.index == transfer.manifest.chunkCount - 1) {
-        await _acknowledgeEmoji(
-          packet.id,
-          'emoji-progress:${chunk.index}',
-          acknowledge,
-        );
+        shouldAcknowledgeProgress = true;
+        acknowledgedChunkIndex = chunk.index;
       }
-    } on Object catch (error) {
-      debugPrint('图片分片无效：$error');
-      _incomingEmojiTransfers.remove(packet.id);
+    } on Object {
+      _removeIncomingTransfer(
+        packet.id,
+        transfer,
+        ImageTransferFailureCategory.validation,
+      );
       await _acknowledgeEmoji(packet.id, 'emoji-failed:chunk', acknowledge);
+      return;
+    }
+    if (shouldAcknowledgeProgress) {
+      await _acknowledgeEmoji(
+        packet.id,
+        'emoji-progress:$acknowledgedChunkIndex',
+        acknowledge,
+      );
     }
   }
 
@@ -1568,14 +1779,22 @@ class _ChatPageState extends State<ChatPage> {
     BlePacket packet,
     Future<void> Function(BlePacket acknowledgement) acknowledge,
   ) async {
-    final transfer = _incomingEmojiTransfers.remove(packet.id);
-    if (transfer == null || packet.payload != transfer.manifest.checksum) {
-      debugPrint('图片完成包无效或传输状态已丢失');
+    final transfer = _incomingEmojiTransfers[packet.id];
+    if (transfer == null) {
+      _recordRejectedIncoming(ImageTransferFailureCategory.validation);
+      await _acknowledgeEmoji(packet.id, 'emoji-failed:complete', acknowledge);
+      return;
+    }
+    _incomingEmojiTransfers.remove(packet.id);
+    transfer.inactivityTimer?.cancel();
+    if (packet.payload != transfer.manifest.checksum) {
+      transfer.metrics.finishFailure(ImageTransferFailureCategory.integrity);
       await _acknowledgeEmoji(packet.id, 'emoji-failed:complete', acknowledge);
       return;
     }
     try {
       final bytes = await transfer.accumulator.assemble();
+      transfer.metrics.markProgress();
       final sticker = await widget.emojiStore.importTransferredImage(
         bytes,
         name: transfer.manifest.name,
@@ -1595,14 +1814,48 @@ class _ChatPageState extends State<ChatPage> {
         await widget.messageStore.saveMessage(message);
         _revealLatestMessage(shouldFollow: shouldFollow);
       }
-      await _acknowledgeEmoji(packet.id, 'emoji-delivered', acknowledge);
-    } on FormatException catch (error) {
-      debugPrint('图片完整性校验失败：$error');
+      transfer.metrics.markProgress();
+    } on FormatException {
+      transfer.metrics.finishFailure(ImageTransferFailureCategory.integrity);
       await _acknowledgeEmoji(packet.id, 'emoji-failed:integrity', acknowledge);
-    } on Object catch (error) {
-      debugPrint('图片保存失败：$error');
+      return;
+    } on Object {
+      transfer.metrics.finishFailure(ImageTransferFailureCategory.storage);
       await _acknowledgeEmoji(packet.id, 'emoji-failed:save', acknowledge);
+      return;
     }
+    transfer.metrics.finishSuccess();
+    await _acknowledgeEmoji(packet.id, 'emoji-delivered', acknowledge);
+  }
+
+  void _scheduleIncomingTransferTimeout(
+    String messageId,
+    _IncomingEmojiTransfer transfer,
+  ) {
+    transfer.inactivityTimer?.cancel();
+    transfer.inactivityTimer = Timer(_incomingTransferInactivityTimeout, () {
+      if (!identical(_incomingEmojiTransfers[messageId], transfer)) return;
+      _incomingEmojiTransfers.remove(messageId);
+      transfer.metrics.finishFailure(ImageTransferFailureCategory.timeout);
+    });
+  }
+
+  void _removeIncomingTransfer(
+    String messageId,
+    _IncomingEmojiTransfer transfer,
+    ImageTransferFailureCategory category,
+  ) {
+    if (identical(_incomingEmojiTransfers[messageId], transfer)) {
+      _incomingEmojiTransfers.remove(messageId);
+    }
+    transfer.inactivityTimer?.cancel();
+    transfer.metrics.finishFailure(category);
+  }
+
+  void _recordRejectedIncoming(ImageTransferFailureCategory category) {
+    _imageTransferMetricsRecorder
+        .start(direction: ImageTransferDirection.incoming)
+        .finishFailure(category);
   }
 
   Future<void> _acknowledgeEmoji(
@@ -1627,6 +1880,7 @@ class _ChatPageState extends State<ChatPage> {
       widget.securityRegistry.clearCentralSession();
     }
     if (peerId != null) widget.securityRegistry.clearPeripheralSession(peerId);
+    await BleBackgroundService.stop();
     if (!mounted) return;
     setState(() => _peripheralPeerId = null);
     ScaffoldMessenger.of(
@@ -1678,14 +1932,30 @@ class _ChatPageState extends State<ChatPage> {
 enum _ChatMenuAction { disconnect }
 
 class _IncomingEmojiTransfer {
-  _IncomingEmojiTransfer(this.manifest)
+  _IncomingEmojiTransfer(this.manifest, this.metrics)
     : accumulator = EmojiTransferAccumulator(manifest);
 
   final EmojiTransferManifest manifest;
-  final EmojiTransferAccumulator accumulator;
+  final ImageTransferMetricSession metrics;
+  EmojiTransferAccumulator accumulator;
+  final Set<int> retriedBatches = <int>{};
+  Timer? inactivityTimer;
+
+  bool matches(EmojiTransferManifest other) =>
+      manifest.byteLength == other.byteLength &&
+      manifest.chunkCount == other.chunkCount &&
+      manifest.checksum == other.checksum;
+
+  void reset() {
+    accumulator = EmojiTransferAccumulator(manifest);
+    retriedBatches.clear();
+  }
 }
 
 class _OutgoingEmojiTransfer {
+  _OutgoingEmojiTransfer(this.metrics);
+
+  final ImageTransferMetricSession metrics;
   final Completer<void> completion = Completer<void>();
   int _highestAcknowledgedChunk = -1;
   Completer<void>? _chunkWaiter;
@@ -1702,6 +1972,7 @@ class _OutgoingEmojiTransfer {
 
   void acknowledge(int chunkIndex) {
     if (chunkIndex <= _highestAcknowledgedChunk) return;
+    metrics.markProgress();
     _highestAcknowledgedChunk = chunkIndex;
     final waiter = _chunkWaiter;
     if (waiter != null &&
@@ -1713,15 +1984,23 @@ class _OutgoingEmojiTransfer {
   }
 }
 
+class _ImageTransferFailure implements Exception {
+  const _ImageTransferFailure(this.category);
+
+  final ImageTransferFailureCategory category;
+}
+
 class SettingsPage extends StatelessWidget {
   const SettingsPage({
     required this.themeController,
     required this.emojiStore,
+    required this.imageTransferMetricsStore,
     super.key,
   });
 
   final ThemeController themeController;
   final EmojiStore emojiStore;
+  final ImageTransferMetricsStore imageTransferMetricsStore;
 
   @override
   Widget build(BuildContext context) {
@@ -1770,6 +2049,19 @@ class SettingsPage extends StatelessWidget {
                   onTap: () => Navigator.of(context).push(
                     MaterialPageRoute<void>(
                       builder: (_) => EmojiManagementPage(store: emojiStore),
+                    ),
+                  ),
+                ),
+                const Divider(height: 1),
+                _SettingsTile(
+                  icon: Icons.monitor_heart_outlined,
+                  title: '图片传输诊断',
+                  subtitle: '查看仅本机保存的加密性能元数据',
+                  onTap: () => Navigator.of(context).push(
+                    MaterialPageRoute<void>(
+                      builder: (_) => TransferDiagnosticsPage(
+                        store: imageTransferMetricsStore,
+                      ),
                     ),
                   ),
                 ),

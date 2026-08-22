@@ -12,6 +12,8 @@ class UniversalBleChatSession implements BleChatSession {
 
   final String deviceId;
   final int _maxFrameSize;
+
+  int get maximumFrameSize => _maxFrameSize;
   final StreamController<List<int>> _incomingController =
       StreamController<List<int>>.broadcast();
   StreamSubscription<dynamic>? _notificationListener;

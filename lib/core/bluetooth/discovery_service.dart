@@ -7,6 +7,26 @@ import 'ble_protocol.dart';
 import 'universal_ble_chat_session.dart';
 import '../security/device_identity_service.dart';
 
+typedef BleMtuRequester = Future<int> Function();
+
+/// MTU 协商只做有限次数尝试；失败时始终回退到兼容的 20 字节帧。
+Future<int> negotiateBleMaximumFrameSize(
+  BleMtuRequester requestMtu, {
+  int maximumAttempts = 2,
+  Duration retryDelay = const Duration(milliseconds: 350),
+}) async {
+  for (var attempt = 0; attempt < maximumAttempts; attempt++) {
+    try {
+      final mtu = await requestMtu();
+      return BleFrameCodec.normalizeMaximumFrameSize(mtu - 3);
+    } on Object {
+      if (attempt == maximumAttempts - 1) break;
+      await Future<void>.delayed(retryDelay);
+    }
+  }
+  return BleFrameCodec.payloadSize;
+}
+
 class NearbyDevice {
   const NearbyDevice({required this.id, required this.name, this.rssi});
 
@@ -21,6 +41,12 @@ abstract interface class DiscoveryService {
   Stream<BlePacket> get incomingPackets;
 
   bool get isConnected;
+
+  int get maximumFrameSize;
+
+  Future<bool> acquireHighPerformanceConnection();
+
+  Future<void> releaseHighPerformanceConnection({required bool acquired});
 
   Future<void> startScan();
 
@@ -68,6 +94,8 @@ class BleDiscoveryService implements DiscoveryService {
   String? _connectedDeviceId;
   UniversalBleChatSession? _chatSession;
   StreamSubscription<List<int>>? _incomingSubscription;
+  int _highPerformanceLeaseCount = 0;
+  Future<void>? _highPerformanceActivation;
 
   @override
   Stream<List<NearbyDevice>> get devices => _devicesController.stream;
@@ -77,6 +105,61 @@ class BleDiscoveryService implements DiscoveryService {
 
   @override
   bool get isConnected => _chatSession != null;
+
+  @override
+  int get maximumFrameSize =>
+      _chatSession?.maximumFrameSize ?? BleFrameCodec.payloadSize;
+
+  @override
+  Future<bool> acquireHighPerformanceConnection() async {
+    final deviceId = _connectedDeviceId;
+    if (deviceId == null || _chatSession == null) return false;
+    _highPerformanceLeaseCount++;
+    final activation = _highPerformanceActivation ??=
+        _activateHighPerformanceConnection(deviceId);
+    try {
+      await activation;
+      return true;
+    } on Object {
+      if (_highPerformanceLeaseCount > 0) _highPerformanceLeaseCount--;
+      if (_highPerformanceLeaseCount == 0 &&
+          identical(_highPerformanceActivation, activation)) {
+        _highPerformanceActivation = null;
+      }
+      return false;
+    }
+  }
+
+  Future<void> _activateHighPerformanceConnection(String deviceId) async {
+    await UniversalBle.requestConnectionPriority(
+      deviceId,
+      BleConnectionPriority.highPerformance,
+      timeout: const Duration(seconds: 2),
+    );
+    // 请求返回表示本机蓝牙栈已接受；给连接参数更新留出一个短窗口。
+    await Future<void>.delayed(const Duration(milliseconds: 250));
+  }
+
+  @override
+  Future<void> releaseHighPerformanceConnection({
+    required bool acquired,
+  }) async {
+    if (!acquired || _highPerformanceLeaseCount == 0) return;
+    _highPerformanceLeaseCount--;
+    if (_highPerformanceLeaseCount > 0) return;
+    _highPerformanceActivation = null;
+    final deviceId = _connectedDeviceId;
+    if (deviceId == null || _chatSession == null) return;
+    try {
+      await UniversalBle.requestConnectionPriority(
+        deviceId,
+        BleConnectionPriority.balanced,
+        timeout: const Duration(seconds: 2),
+      );
+    } on Object {
+      // 恢复平衡模式是节能清理，不得反向改变已完成的消息结果。
+    }
+  }
 
   @override
   Future<void> startScan() async {
@@ -165,18 +248,13 @@ class BleDiscoveryService implements DiscoveryService {
   }
 
   Future<int> _negotiateMaxFrameSize(String deviceId) async {
-    try {
-      final mtu = await UniversalBle.requestMtu(
+    return negotiateBleMaximumFrameSize(
+      () => UniversalBle.requestMtu(
         deviceId,
         247,
         timeout: const Duration(seconds: 4),
-      );
-      // ATT 写入值最大为 MTU - 3；244 是 Android 上兼容性良好的上限。
-      return (mtu - 3).clamp(BleFrameCodec.payloadSize, 244).toInt();
-    } on Object {
-      // MTU 协商是尽力而为。失败时安全回退到默认 20 字节帧。
-      return BleFrameCodec.payloadSize;
-    }
+      ),
+    );
   }
 
   Future<void> _ensurePermissions() async {
@@ -192,6 +270,8 @@ class BleDiscoveryService implements DiscoveryService {
   @override
   Future<void> disconnect() async {
     final id = _connectedDeviceId;
+    _highPerformanceLeaseCount = 0;
+    _highPerformanceActivation = null;
     await _incomingSubscription?.cancel();
     _incomingSubscription = null;
     await _chatSession?.close();
@@ -236,6 +316,17 @@ class FakeDiscoveryService implements DiscoveryService {
 
   @override
   bool get isConnected => _connected;
+
+  @override
+  int get maximumFrameSize => BleFrameCodec.payloadSize;
+
+  @override
+  Future<bool> acquireHighPerformanceConnection() async => false;
+
+  @override
+  Future<void> releaseHighPerformanceConnection({
+    required bool acquired,
+  }) async {}
 
   @override
   Future<void> startScan() async {

@@ -22,9 +22,9 @@ class UniversalBlePeripheralChat {
         .listen(_flushPendingNotifications);
     _mtuListener = UniversalBlePeripheral.mtuChangedStream.listen((event) {
       // ATT 通知值同样受 MTU - 3 限制，保留默认值作为协商前的安全回退。
-      _maxFrameSizes[event.deviceId] = (event.mtu - 3)
-          .clamp(BleFrameCodec.payloadSize, 244)
-          .toInt();
+      _maxFrameSizes[event.deviceId] = BleFrameCodec.normalizeMaximumFrameSize(
+        event.mtu - 3,
+      );
     });
   }
 
@@ -152,7 +152,7 @@ class UniversalBlePeripheralChat {
   }
 
   Future<void> _sendNow(String deviceId, BlePacket packet) async {
-    final maxFrameSize = _maxFrameSizes[deviceId] ?? BleFrameCodec.payloadSize;
+    final maxFrameSize = await resolveMaximumFrameSize(deviceId);
     for (final frame in BleFrameCodec.split(
       packet.encode(),
       maxFrameSize: maxFrameSize,
@@ -160,6 +160,32 @@ class UniversalBlePeripheralChat {
       await _notifyFrameWithRetry(deviceId, frame);
       await Future<void>.delayed(_notificationFrameInterval);
     }
+  }
+
+  int maximumFrameSizeFor(String deviceId) =>
+      _maxFrameSizes[deviceId] ?? BleFrameCodec.payloadSize;
+
+  /// MTU 事件可能先于 Dart 监听器抵达；发送前主动查询一次平台端缓存。
+  /// 查询失败时继续使用 20 字节帧，不牺牲既有兼容性和可靠性。
+  Future<int> resolveMaximumFrameSize(String deviceId) async {
+    final cached = maximumFrameSizeFor(deviceId);
+    if (cached > BleFrameCodec.payloadSize) return cached;
+    try {
+      final maximumNotifyLength =
+          await UniversalBlePeripheral.getMaximumNotifyLength(
+            deviceId,
+          ).timeout(_notificationTimeout);
+      if (maximumNotifyLength != null) {
+        final resolved = BleFrameCodec.normalizeMaximumFrameSize(
+          maximumNotifyLength,
+        );
+        _maxFrameSizes[deviceId] = resolved;
+        return resolved;
+      }
+    } on Object {
+      // 最大通知长度查询是尽力而为；默认帧仍是安全回退。
+    }
+    return cached;
   }
 
   /// 通知队列在高频图片传输时同样可能暂时繁忙；只重试当前帧，保持顺序。

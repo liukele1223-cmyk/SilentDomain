@@ -133,6 +133,8 @@ class EmojiTransferAccumulator {
 
   double get progress => _chunks.length / manifest.chunkCount;
 
+  bool hasChunk(int index) => _chunks.containsKey(index);
+
   void add(int index, Uint8List bytes) {
     if (index < 0 || index >= manifest.chunkCount) {
       throw const FormatException('图片分片序号无效');

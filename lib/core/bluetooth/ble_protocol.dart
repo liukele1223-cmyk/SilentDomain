@@ -80,6 +80,9 @@ abstract final class BleFrameCodec {
   static const _headerSize = 6;
   static int _nextTransferId = 0;
 
+  static int normalizeMaximumFrameSize(int value) =>
+      value.clamp(payloadSize, 244).toInt();
+
   static List<Uint8List> split(
     Uint8List bytes, {
     int maxFrameSize = payloadSize,
